@@ -208,7 +208,8 @@ install_openlist() {
     return 0
   fi
 
-  download_and_install
+  download_and_install || return 1
+  start_openlist
 }
 
 update_openlist() {
