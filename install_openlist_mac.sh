@@ -104,6 +104,48 @@ download_url() {
   echo "https://github.com/OpenListTeam/OpenList/releases/latest/download/openlist-darwin-${arch}.tar.gz"
 }
 
+normalize_version() {
+  printf '%s\n' "$1" | sed 's/^[Vv]//' | grep -Eo '[0-9]+(\.[0-9]+){1,3}' | head -n 1
+}
+
+get_local_version() {
+  local raw
+
+  if [ ! -x "$APP_BIN" ]; then
+    return 1
+  fi
+
+  raw="$("$APP_BIN" version 2>/dev/null | head -n 1)"
+  normalize_version "$raw"
+}
+
+get_latest_version() {
+  local raw
+
+  require_cmd "curl" "macOS 通常自带 curl。"
+  raw="$(curl -fsSL https://api.github.com/repos/OpenListTeam/OpenList/releases/latest | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  normalize_version "$raw"
+}
+
+version_to_sort_key() {
+  local version
+  local a b c d
+
+  version="$1"
+  IFS='.' read -r a b c d <<EOFV
+$version
+EOFV
+  a="${a:-0}"
+  b="${b:-0}"
+  c="${c:-0}"
+  d="${d:-0}"
+  printf '%05d%05d%05d%05d\n' "$a" "$b" "$c" "$d"
+}
+
+is_version_newer() {
+  [ "$(version_to_sort_key "$1")" '>' "$(version_to_sort_key "$2")" ]
+}
+
 require_installed() {
   if [ ! -x "$APP_BIN" ]; then
     print_msg "$RED" "未检测到 OpenList，请先安装。"
@@ -217,7 +259,37 @@ install_openlist() {
 }
 
 update_openlist() {
-  download_and_install
+  local local_version latest_version
+
+  if [ ! -x "$APP_BIN" ]; then
+    print_msg "$YELLOW" "当前未安装 OpenList，先执行安装。"
+    install_openlist
+    return
+  fi
+
+  local_version="$(get_local_version)"
+  latest_version="$(get_latest_version)"
+
+  if [ -z "$local_version" ]; then
+    print_msg "$YELLOW" "未能识别当前本地版本，将直接尝试更新。"
+    download_and_install
+    return
+  fi
+
+  if [ -z "$latest_version" ]; then
+    print_msg "$RED" "未能获取 OpenList 官方最新版本信息，请稍后再试。"
+    return 1
+  fi
+
+  printf "本地版本：%b%s%b\n" "$BLUE" "$local_version" "$NC"
+  printf "官方版本：%b%s%b\n" "$BLUE" "$latest_version" "$NC"
+
+  if is_version_newer "$latest_version" "$local_version"; then
+    print_msg "$YELLOW" "检测到官方有更新，正在升级..."
+    download_and_install
+  else
+    print_msg "$GREEN" "当前已是最新版，无需更新。"
+  fi
 }
 
 start_openlist() {
