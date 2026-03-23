@@ -94,26 +94,6 @@ openlist
 - `openlist` 菜单入口
 - 脚本本身
 
-## 发布到 GitHub
-
-推荐仓库内至少包含这两个文件：
-
-- `install_openlist_mac.sh`
-- `README.md`
-
-上传到 GitHub 后，别人就可以通过 `curl + bash` 一键安装。
-
-如果你打算公开发布，建议把 README 里的这段命令改成你的真实地址：
-
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库/main/install_openlist_mac.sh)"
-```
-
-例如：
-
-```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/example/openlist-macos-installer/main/install_openlist_mac.sh)"
-```
 
 ## 说明
 
