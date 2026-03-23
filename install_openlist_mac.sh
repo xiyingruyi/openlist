@@ -541,9 +541,12 @@ warn_if_legacy_remains
 
 cat <<MSG
 ============================================
-OpenList 菜单脚本已部署完成
-以后在终端输入：openlist
-即可打开菜单
+OpenList 菜单脚本安装成功
+
+请在终端输入：
+  openlist
+
+即可进入 OpenList 管理脚本菜单
 
 如果提示找不到 openlist，可直接运行：
   $MANAGER_PATH
