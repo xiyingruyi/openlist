@@ -44,6 +44,7 @@ MANAGER_DIR="$HOME/.openlist-manager"
 APP_DIR="$MANAGER_DIR/app"
 TMP_DIR="$MANAGER_DIR/tmp"
 APP_BIN="$APP_DIR/openlist"
+VERSION_FILE="$APP_DIR/version.txt"
 ARCHIVE_PATH="$TMP_DIR/openlist.tar.gz"
 EXTRACT_DIR="$TMP_DIR/extract"
 DATA_DIR="$HOME/Library/Application Support/OpenList/data"
@@ -110,6 +111,15 @@ normalize_version() {
 
 get_local_version() {
   local raw
+
+  if [ -f "$VERSION_FILE" ]; then
+    raw="$(cat "$VERSION_FILE" 2>/dev/null)"
+    raw="$(normalize_version "$raw")"
+    if [ -n "$raw" ]; then
+      printf '%s\n' "$raw"
+      return 0
+    fi
+  fi
 
   if [ ! -x "$APP_BIN" ]; then
     return 1
@@ -196,8 +206,8 @@ offer_set_password_now() {
   local choice new_pass
 
   echo
-  read -r -p "是否现在就设置一个你自己的管理员密码？(y/N): " choice
-  if [[ "$choice" != "y" && "$choice" != "Y" ]]; then
+  read -r -p "是否现在就设置一个你自己的管理员密码？(Y/n): " choice
+  if [[ "$choice" = "n" || "$choice" = "N" ]]; then
     return 0
   fi
 
@@ -216,13 +226,19 @@ offer_set_password_now() {
 }
 
 download_and_install() {
-  local url found_bin
+  local url found_bin latest_version
 
   require_cmd "curl" "macOS 通常自带 curl。"
   require_cmd "tar" "macOS 通常自带 tar。"
   prepare_dirs
 
+  latest_version="$(get_latest_version)"
   url="$(download_url)" || return 1
+
+  if [ -z "$latest_version" ]; then
+    print_msg "$RED" "未能获取 OpenList 官方最新版本信息，请稍后再试。"
+    return 1
+  fi
 
   print_msg "$BLUE" "正在从 OpenList 官方发布页下载最新版本..."
   rm -rf "$EXTRACT_DIR"
@@ -243,9 +259,10 @@ download_and_install() {
   rm -f "$APP_BIN"
   cp "$found_bin" "$APP_BIN"
   chmod +x "$APP_BIN"
+  printf '%s\n' "$latest_version" > "$VERSION_FILE"
   rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
 
-  print_msg "$GREEN" "OpenList 安装/更新完成。"
+  print_msg "$GREEN" "OpenList 安装/更新完成。当前版本：$latest_version"
 }
 
 install_openlist() {
@@ -442,6 +459,20 @@ password_menu() {
   esac
 }
 
+run_official_command() {
+  require_installed || return 1
+  prepare_dirs
+
+  case "${1:-}" in
+    server|admin)
+      "$APP_BIN" --data "$DATA_DIR" "$@"
+      ;;
+    *)
+      "$APP_BIN" "$@"
+      ;;
+  esac
+}
+
 show_logs() {
   prepare_dirs
   touch "$LOG_PATH"
@@ -517,9 +548,9 @@ full_uninstall() {
   local confirm
 
   print_msg "$RED" "警告：此操作将删除 OpenList 程序、数据、日志、自启项及本脚本本身。"
-  read -r -p "确认继续吗？(y/N): " confirm
+  read -r -p "确认继续吗？(Y/n): " confirm
 
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+  if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
     print_msg "$YELLOW" "已取消卸载。"
     return 0
   fi
@@ -552,6 +583,11 @@ show_menu() {
   echo " 0. 退出脚本"
   echo
 }
+
+if [ "$#" -gt 0 ]; then
+  run_official_command "$@"
+  exit $?
+fi
 
 while true; do
   show_menu
