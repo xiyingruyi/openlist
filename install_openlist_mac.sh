@@ -167,6 +167,10 @@ offer_set_password_now() {
 
   "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass"
   print_msg "$GREEN" "管理员密码已更新为你刚输入的新密码。"
+  if is_running; then
+    print_msg "$BLUE" "正在重启 OpenList，使新密码立即生效并清除登录封禁..."
+    restart_openlist
+  fi
 }
 
 download_and_install() {
@@ -234,7 +238,7 @@ start_openlist() {
   fi
 
   print_msg "$BLUE" "正在启动 OpenList..."
-  nohup "$APP_BIN" server --data "$DATA_DIR" >>"$LOG_PATH" 2>&1 &
+  nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
   echo $! > "$PID_PATH"
   sleep 2
 
@@ -341,6 +345,10 @@ password_menu() {
   case "$choice" in
     1)
       "$APP_BIN" --data "$DATA_DIR" admin random
+      if is_running; then
+        print_msg "$BLUE" "正在重启 OpenList，使新密码立即生效并清除登录封禁..."
+        restart_openlist
+      fi
       ;;
     2)
       read -r -p "请输入新的管理员密码: " new_pass
@@ -350,6 +358,10 @@ password_menu() {
       fi
       "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass"
       print_msg "$GREEN" "管理员密码已重置。"
+      if is_running; then
+        print_msg "$BLUE" "正在重启 OpenList，使新密码立即生效并清除登录封禁..."
+        restart_openlist
+      fi
       ;;
     *)
       print_msg "$RED" "无效选择。"
@@ -378,9 +390,9 @@ write_plist() {
   <key>ProgramArguments</key>
   <array>
     <string>$APP_BIN</string>
-    <string>server</string>
     <string>--data</string>
     <string>$DATA_DIR</string>
+    <string>server</string>
   </array>
   <key>RunAtLoad</key>
   <true/>
