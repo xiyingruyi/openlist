@@ -54,6 +54,7 @@ LOG_PATH="$LOG_DIR/openlist.log"
 PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
 DEFAULT_URL="http://127.0.0.1:5244"
+INSTALLER_URL="https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -570,6 +571,24 @@ full_uninstall() {
   exit 0
 }
 
+update_script() {
+  local temp_installer
+
+  require_cmd "curl" "macOS 通常自带 curl。"
+  prepare_dirs
+  temp_installer="$TMP_DIR/install_openlist_mac.sh"
+
+  print_msg "$BLUE" "正在从 GitHub 获取最新脚本..."
+  curl -fsSL "$INSTALLER_URL" -o "$temp_installer"
+  chmod +x "$temp_installer"
+
+  print_msg "$BLUE" "正在更新本地脚本..."
+  bash "$temp_installer"
+
+  print_msg "$GREEN" "脚本更新完成。请重新输入 openlist 进入最新版菜单。"
+  exit 0
+}
+
 show_menu() {
   clear
   printf "%b====================================%b\n" "$GREEN" "$NC"
@@ -587,6 +606,7 @@ show_menu() {
   echo "10. 查看实时运行日志"
   echo "11. 设置开机自启"
   echo "12. 取消开机自启"
+  echo "13. 更新脚本"
   echo " 0. 退出脚本"
   echo
 }
@@ -614,6 +634,7 @@ while true; do
     10) show_logs ;;
     11) enable_autostart ;;
     12) disable_autostart ;;
+    13) update_script ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
