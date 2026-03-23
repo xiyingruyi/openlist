@@ -30,10 +30,10 @@ openlist
 
 ## 一键安装
 
-把下面命令里的仓库地址替换成你自己的 GitHub 仓库地址后，其他电脑就可以直接执行：
+现在可以直接使用你新的 GitHub 仓库地址，其他电脑可直接执行：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/你的用户名/你的仓库/main/install_openlist_mac.sh)"
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh)"
 ```
 
 运行完成后，终端输入：
@@ -94,6 +94,26 @@ openlist
 - `openlist` 菜单入口
 - 脚本本身
 
+## 发布到 GitHub
+
+推荐仓库内至少包含这两个文件：
+
+- `install_openlist_mac.sh`
+- `README.md`
+
+上传到 GitHub 后，别人就可以通过 `curl + bash` 一键安装。
+
+当前仓库的一键安装命令就是：
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh)"
+```
+
+如果你更习惯使用 `refs/heads/main` 形式，也可以：
+
+```bash
+bash -c "$(curl -fsSL https://raw.githubusercontent.com/xiyingruyi/openlist/refs/heads/main/install_openlist_mac.sh)"
+```
 
 ## 说明
 
