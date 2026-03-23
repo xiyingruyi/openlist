@@ -206,7 +206,7 @@ offer_set_password_now() {
   local choice new_pass
 
   echo
-  read -r -p "是否现在就设置一个你自己的管理员密码？(Y/n): " choice
+  read -r -p "是否现在就设置一个你自己的管理员密码？(Y/N，默认为Y): " choice
   if [[ "$choice" = "n" || "$choice" = "N" ]]; then
     return 0
   fi
@@ -381,12 +381,19 @@ restart_openlist() {
 }
 
 show_status() {
+  local current_version
+
   cleanup_stale_pid
 
   if [ -x "$APP_BIN" ]; then
+    current_version="$(get_local_version)"
     printf "程序状态：%b已安装%b\n" "$GREEN" "$NC"
     printf "程序路径：%b%s%b\n" "$BLUE" "$APP_BIN" "$NC"
-    printf "程序版本：%b%s%b\n" "$GREEN" "$("$APP_BIN" version 2>/dev/null | head -n 1)" "$NC"
+    if [ -n "$current_version" ]; then
+      printf "程序版本：%b%s%b\n" "$GREEN" "$current_version" "$NC"
+    else
+      printf "程序版本：%b未识别%b\n" "$YELLOW" "$NC"
+    fi
   else
     printf "程序状态：%b未安装%b\n" "$RED" "$NC"
   fi
@@ -548,7 +555,7 @@ full_uninstall() {
   local confirm
 
   print_msg "$RED" "警告：此操作将删除 OpenList 程序、数据、日志、自启项及本脚本本身。"
-  read -r -p "确认继续吗？(Y/n): " confirm
+  read -r -p "确认继续吗？(Y/N，默认为Y): " confirm
 
   if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
     print_msg "$YELLOW" "已取消卸载。"
