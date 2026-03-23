@@ -115,7 +115,7 @@ get_local_version() {
     return 1
   fi
 
-  raw="$("$APP_BIN" version 2>/dev/null | head -n 1)"
+  raw="$("$APP_BIN" version 2>/dev/null)"
   normalize_version "$raw"
 }
 
