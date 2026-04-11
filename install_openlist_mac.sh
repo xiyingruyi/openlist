@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/bin/zsh
 
 set -euo pipefail
 
@@ -35,7 +35,7 @@ WARN
 }
 
 cat > "$MANAGER_PATH" <<'EOF'
-#!/bin/bash
+#!/bin/zsh
 
 set -u
 
@@ -70,8 +70,19 @@ print_msg() {
 
 pause() {
   echo
-  read -n 1 -s -r -p "按任意键返回主菜单..."
+  if [[ -t 0 ]]; then
+    read -rsk 1 "REPLY?按任意键返回主菜单..."
+  else
+    IFS= read -r REPLY
+  fi
   echo
+}
+
+prompt_input() {
+  local prompt="$1"
+
+  printf "%s" "$prompt"
+  IFS= read -r REPLY
 }
 
 prepare_dirs() {
@@ -207,12 +218,14 @@ offer_set_password_now() {
   local choice new_pass
 
   echo
-  read -r -p "是否现在就设置一个你自己的管理员密码？(Y/N，默认为Y): " choice
+  prompt_input "是否现在就设置一个你自己的管理员密码？(Y/N，默认为Y): "
+  choice="$REPLY"
   if [[ "$choice" = "n" || "$choice" = "N" ]]; then
     return 0
   fi
 
-  read -r -p "请输入新的管理员密码: " new_pass
+  prompt_input "请输入新的管理员密码: "
+  new_pass="$REPLY"
   if [ -z "$new_pass" ]; then
     print_msg "$RED" "密码不能为空，已跳过设置。"
     return 1
@@ -437,7 +450,8 @@ password_menu() {
 
   echo "1. 随机生成新密码"
   echo "2. 手动设置新密码"
-  read -r -p "请选择(1/2): " choice
+  prompt_input "请选择(1/2): "
+  choice="$REPLY"
 
   case "$choice" in
     1)
@@ -448,7 +462,8 @@ password_menu() {
       fi
       ;;
     2)
-      read -r -p "请输入新的管理员密码: " new_pass
+      prompt_input "请输入新的管理员密码: "
+      new_pass="$REPLY"
       if [ -z "$new_pass" ]; then
         print_msg "$RED" "密码不能为空。"
         return 1
@@ -556,7 +571,8 @@ full_uninstall() {
   local confirm
 
   print_msg "$RED" "警告：此操作将删除 OpenList 程序、数据、日志、自启项及本脚本本身。"
-  read -r -p "确认继续吗？(Y/N，默认为Y): " confirm
+  prompt_input "确认继续吗？(Y/N，默认为Y): "
+  confirm="$REPLY"
 
   if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
     print_msg "$YELLOW" "已取消卸载。"
@@ -583,7 +599,7 @@ update_script() {
   chmod +x "$temp_installer"
 
   print_msg "$BLUE" "正在更新本地脚本..."
-  bash "$temp_installer"
+  zsh "$temp_installer"
 
   print_msg "$GREEN" "脚本更新完成。请重新输入 openlist 进入最新版菜单。"
   exit 0
@@ -618,7 +634,8 @@ fi
 
 while true; do
   show_menu
-  read -r -p "请输入菜单编号: " choice
+  prompt_input "请输入菜单编号: "
+  choice="$REPLY"
   clear
 
   case "$choice" in
