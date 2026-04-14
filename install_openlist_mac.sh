@@ -41,6 +41,7 @@ set -u
 
 APP_NAME="OpenList"
 MANAGER_DIR="$HOME/.openlist-manager"
+MANAGER_PATH="$MANAGER_DIR/openlist-menu.sh"
 APP_DIR="$MANAGER_DIR/app"
 TMP_DIR="$MANAGER_DIR/tmp"
 APP_BIN="$APP_DIR/openlist"
