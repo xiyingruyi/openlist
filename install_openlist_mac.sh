@@ -194,6 +194,62 @@ is_running() {
     printf '%s\n' "$cmdline" | grep -F "$DATA_DIR" >/dev/null 2>&1
 }
 
+get_http_port() {
+  local port
+
+  if [ -f "$DATA_DIR/config.json" ]; then
+    port="$(sed -n 's/.*"http_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$DATA_DIR/config.json" | head -n 1)"
+  fi
+
+  printf '%s\n' "${port:-5244}"
+}
+
+pid_is_openlist_server() {
+  local pid="$1"
+  local http_port
+
+  [ -n "$pid" ] || return 1
+  http_port="$(get_http_port)"
+  lsof -nP -a -p "$pid" -iTCP:"$http_port" -sTCP:LISTEN >/dev/null 2>&1
+}
+
+get_launchd_pid() {
+  local launchd_info
+  local pid
+
+  launchd_info="$(launchctl print "gui/$(id -u)/com.openlist.server" 2>/dev/null || true)"
+  [ -n "$launchd_info" ] || return 1
+
+  printf '%s\n' "$launchd_info" | grep -F "state = running" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$launchd_info" | grep -F "program = $APP_BIN" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$launchd_info" | grep -F "$DATA_DIR" >/dev/null 2>&1 || return 1
+  printf '%s\n' "$launchd_info" | grep -F "server" >/dev/null 2>&1 || return 1
+
+  pid="$(printf '%s\n' "$launchd_info" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p' | head -n 1)"
+  pid_is_openlist_server "$pid" || return 1
+  printf '%s\n' "$pid"
+}
+
+get_running_pid() {
+  local pid
+
+  if [ -f "$PID_PATH" ]; then
+    pid="$(cat "$PID_PATH" 2>/dev/null)"
+    if pid_is_openlist_server "$pid"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  fi
+
+  pid="$(get_launchd_pid 2>/dev/null || true)"
+  if pid_is_openlist_server "$pid"; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+
+  return 1
+}
+
 cleanup_stale_pid() {
   if ! is_running; then
     rm -f "$PID_PATH"
@@ -325,6 +381,7 @@ update_openlist() {
 
 start_openlist() {
   local first_run
+  local running_pid
 
   require_installed || return 1
   prepare_dirs
@@ -335,7 +392,8 @@ start_openlist() {
     first_run=1
   fi
 
-  if is_running; then
+  running_pid="$(get_running_pid 2>/dev/null || true)"
+  if [ -n "$running_pid" ]; then
     print_msg "$YELLOW" "OpenList 已在运行。"
     return 0
   fi
@@ -396,6 +454,7 @@ restart_openlist() {
 
 show_status() {
   local current_version
+  local running_pid
 
   cleanup_stale_pid
 
@@ -412,10 +471,11 @@ show_status() {
     printf "程序状态：%b未安装%b\n" "$RED" "$NC"
   fi
 
-  if is_running; then
+  running_pid="$(get_running_pid 2>/dev/null || true)"
+  if [ -n "$running_pid" ]; then
     printf "运行状态：%b运行中%b\n" "$GREEN" "$NC"
     printf "访问地址：%b%s%b\n" "$BLUE" "$DEFAULT_URL" "$NC"
-    printf "进程 PID：%b%s%b\n" "$GREEN" "$(cat "$PID_PATH")" "$NC"
+    printf "进程 PID：%b%s%b\n" "$GREEN" "$running_pid" "$NC"
   else
     printf "运行状态：%b已停止%b\n" "$RED" "$NC"
   fi
@@ -433,7 +493,7 @@ show_status() {
 open_console() {
   require_cmd "open" "macOS 自带 open 命令。"
 
-  if ! is_running; then
+  if ! get_running_pid >/dev/null 2>&1; then
     print_msg "$YELLOW" "OpenList 尚未运行，正在自动启动..."
     start_openlist || return 1
   fi
@@ -709,7 +769,7 @@ cat <<MSG
 ============================================
 OpenList 菜单脚本安装成功
 
-请在终端输入：
+以后你可以在终端输入：
   openlist
 
 即可进入 OpenList 管理脚本菜单
@@ -724,3 +784,9 @@ OpenList 菜单脚本安装成功
   hash -r
 ============================================
 MSG
+
+if [[ -t 0 && -t 1 ]]; then
+  echo
+  echo "正在进入 OpenList 管理菜单..."
+  exec "$MANAGER_PATH"
+fi
