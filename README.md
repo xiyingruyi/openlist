@@ -33,7 +33,7 @@ openlist
 现在可以直接使用你新的 GitHub 仓库地址，其他电脑可直接执行：
 
 ```bash
-bash -c "$(curl -fsSL https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh)"
+curl -fsSL https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh | zsh
 ```
 
 运行完成后，终端输入：
