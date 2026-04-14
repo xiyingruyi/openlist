@@ -659,9 +659,13 @@ update_script() {
   chmod +x "$temp_installer"
 
   print_msg "$BLUE" "正在更新本地脚本..."
-  zsh "$temp_installer"
+  OPENLIST_SKIP_MENU_AUTORUN=1 zsh "$temp_installer"
 
-  print_msg "$GREEN" "脚本更新完成。请重新输入 openlist 进入最新版菜单。"
+  print_msg "$GREEN" "脚本更新完成。"
+  if [[ -t 0 && -t 1 ]]; then
+    pause
+    exec "$MANAGER_PATH"
+  fi
   exit 0
 }
 
@@ -785,7 +789,7 @@ OpenList 菜单脚本安装成功
 ============================================
 MSG
 
-if [[ -t 0 && -t 1 ]]; then
+if [[ "${OPENLIST_SKIP_MENU_AUTORUN:-0}" != "1" && -t 0 && -t 1 ]]; then
   echo
   echo "正在进入 OpenList 管理菜单..."
   exec "$MANAGER_PATH"
