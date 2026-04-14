@@ -177,22 +177,7 @@ require_installed() {
 }
 
 is_running() {
-  local pid
-  local cmdline
-
-  if [ ! -f "$PID_PATH" ]; then
-    return 1
-  fi
-
-  pid="$(cat "$PID_PATH" 2>/dev/null)"
-  [ -n "$pid" ] || return 1
-
-  cmdline="$(ps -p "$pid" -o command= 2>/dev/null || true)"
-  [ -n "$cmdline" ] || return 1
-
-  printf '%s\n' "$cmdline" | grep -F "$APP_BIN" >/dev/null 2>&1 &&
-    printf '%s\n' "$cmdline" | grep -F "server" >/dev/null 2>&1 &&
-    printf '%s\n' "$cmdline" | grep -F "$DATA_DIR" >/dev/null 2>&1
+  get_running_pid >/dev/null 2>&1
 }
 
 get_http_port() {
@@ -399,12 +384,20 @@ start_openlist() {
     return 0
   fi
 
-  print_msg "$BLUE" "正在启动 OpenList..."
-  nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
-  echo $! > "$PID_PATH"
+  if [ -f "$PLIST_PATH" ]; then
+    print_msg "$BLUE" "检测到已开启开机自启，正在通过 launchd 启动 OpenList..."
+    launchctl_bootout
+    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+    launchctl enable "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
+  else
+    print_msg "$BLUE" "正在启动 OpenList..."
+    nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
+    echo $! > "$PID_PATH"
+  fi
   sleep 2
 
-  if is_running; then
+  running_pid="$(get_running_pid 2>/dev/null || true)"
+  if [ -n "$running_pid" ]; then
     print_msg "$GREEN" "OpenList 启动成功。"
     printf "访问地址：%b%s%b\n" "$BLUE" "$DEFAULT_URL" "$NC"
     if [ "$first_run" -eq 1 ]; then
@@ -424,13 +417,16 @@ stop_openlist() {
 
   cleanup_stale_pid
 
-  if ! is_running; then
+  pid="$(get_running_pid 2>/dev/null || true)"
+  if [ -z "$pid" ]; then
     print_msg "$YELLOW" "OpenList 当前未运行。"
     return 0
   fi
 
-  pid="$(cat "$PID_PATH")"
   print_msg "$BLUE" "正在停止 OpenList..."
+  if [ -f "$PLIST_PATH" ]; then
+    launchctl_bootout
+  fi
   kill "$pid" >/dev/null 2>&1 || true
 
   for _ in 1 2 3 4 5; do
@@ -441,7 +437,8 @@ stop_openlist() {
   done
 
   if is_running; then
-    kill -9 "$pid" >/dev/null 2>&1 || true
+    pid="$(get_running_pid 2>/dev/null || true)"
+    [ -n "$pid" ] && kill -9 "$pid" >/dev/null 2>&1 || true
   fi
 
   rm -f "$PID_PATH"
