@@ -52,6 +52,7 @@ DATA_DIR="$HOME/Library/Application Support/OpenList/data"
 RUN_DIR="$HOME/Library/Application Support/OpenList/run"
 LOG_DIR="$HOME/Library/Logs/OpenList"
 LOG_PATH="$LOG_DIR/openlist.log"
+DATA_LOG_DIR="$DATA_DIR/log"
 PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
 DEFAULT_URL="http://127.0.0.1:5244"
@@ -582,7 +583,7 @@ restore_backup() {
 }
 
 login_troubleshooting() {
-  local auth_log="$DATA_DIR/log/log.log"
+  local auth_log="$DATA_LOG_DIR/log.log"
 
   prepare_dirs
   print_msg "$YELLOW" "OpenList 官方网页理论上会在登录失败时弹出错误提示。"
@@ -604,6 +605,56 @@ login_troubleshooting() {
   else
     print_msg "$YELLOW" "暂未找到登录日志。"
   fi
+}
+
+clear_logs() {
+  local was_running=0
+  local restart_choice=""
+
+  if is_running; then
+    was_running=1
+    print_msg "$BLUE" "OpenList 正在运行，先停止后再清理日志，避免残留正在写入的日志文件。"
+    stop_openlist
+  fi
+
+  rm -rf "$LOG_DIR" "$DATA_LOG_DIR"
+  print_msg "$GREEN" "日志目录已清理完成。"
+  printf "已删除：%b%s%b\n" "$BLUE" "$LOG_DIR" "$NC"
+  printf "已删除：%b%s%b\n" "$BLUE" "$DATA_LOG_DIR" "$NC"
+
+  if [ "$was_running" -eq 1 ]; then
+    echo
+    prompt_input "OpenList 一旦重新启动会重新生成新日志，是否现在就重启？(Y/N，默认为N): "
+    restart_choice="$REPLY"
+    if [[ "$restart_choice" = "y" || "$restart_choice" = "Y" ]]; then
+      start_openlist
+    else
+      print_msg "$YELLOW" "OpenList 当前保持停止状态，避免刚清完日志又立刻生成新日志。"
+    fi
+  fi
+}
+
+delete_backups() {
+  local confirm
+
+  if [ ! -d "$BACKUP_DIR" ]; then
+    print_msg "$YELLOW" "当前没有备份目录可删除。"
+    return 0
+  fi
+
+  print_msg "$RED" "警告：此操作将删除整个备份目录及其中所有备份文件。"
+  printf "目标目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
+  prompt_input "确认继续吗？(Y/N，默认为Y): "
+  confirm="$REPLY"
+
+  if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
+    print_msg "$YELLOW" "已取消删除备份目录。"
+    return 0
+  fi
+
+  rm -rf "$BACKUP_DIR"
+  print_msg "$GREEN" "备份目录已删除完成。"
+  printf "已删除：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
 }
 
 show_status() {
@@ -717,6 +768,12 @@ run_official_command() {
     restore)
       shift
       restore_backup "${1:-}"
+      ;;
+    clear-logs)
+      clear_logs
+      ;;
+    delete-backups)
+      delete_backups
       ;;
     login-help)
       login_troubleshooting
@@ -864,7 +921,9 @@ show_menu() {
   echo "13. 登录故障排查"
   echo "14. 备份 OpenList 数据"
   echo "15. 还原 OpenList 数据"
-  echo "16. 更新脚本"
+  echo "16. 清空日志目录"
+  echo "17. 删除整个备份目录"
+  echo "18. 更新脚本"
   echo " 0. 退出脚本"
   echo
 }
@@ -896,7 +955,9 @@ while true; do
     13) login_troubleshooting ;;
     14) create_backup ;;
     15) restore_backup ;;
-    16) update_script ;;
+    16) clear_logs ;;
+    17) delete_backups ;;
+    18) update_script ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
