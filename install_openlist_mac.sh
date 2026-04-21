@@ -55,6 +55,7 @@ LOG_PATH="$LOG_DIR/openlist.log"
 PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
 DEFAULT_URL="http://127.0.0.1:5244"
+BACKUP_DIR="$HOME/OpenList-Backups"
 INSTALLER_URL="https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh"
 
 GREEN='\033[0;32m'
@@ -87,7 +88,7 @@ prompt_input() {
 }
 
 prepare_dirs() {
-  mkdir -p "$MANAGER_DIR" "$APP_DIR" "$TMP_DIR" "$DATA_DIR" "$RUN_DIR" "$LOG_DIR"
+  mkdir -p "$MANAGER_DIR" "$APP_DIR" "$TMP_DIR" "$DATA_DIR" "$RUN_DIR" "$LOG_DIR" "$BACKUP_DIR"
 }
 
 require_cmd() {
@@ -174,6 +175,33 @@ require_installed() {
     print_msg "$RED" "未检测到 OpenList，请先安装。"
     return 1
   fi
+}
+
+latest_backup_file() {
+  ls -1t "$BACKUP_DIR"/openlist-backup-*.tar.gz 2>/dev/null | head -n 1
+}
+
+create_backup_archive() {
+  local prefix="$1"
+  local timestamp archive
+
+  require_cmd "tar" "macOS 通常自带 tar。"
+  prepare_dirs
+
+  if [ ! -d "$DATA_DIR" ]; then
+    print_msg "$RED" "未找到 OpenList 数据目录：$DATA_DIR"
+    return 1
+  fi
+
+  timestamp="$(date '+%Y%m%d-%H%M%S')"
+  if [ -n "$prefix" ]; then
+    archive="$BACKUP_DIR/openlist-backup-${prefix}-${timestamp}.tar.gz"
+  else
+    archive="$BACKUP_DIR/openlist-backup-${timestamp}.tar.gz"
+  fi
+
+  tar -czf "$archive" -C "$(dirname "$DATA_DIR")" "$(basename "$DATA_DIR")"
+  printf '%s\n' "$archive"
 }
 
 is_running() {
@@ -450,9 +478,138 @@ restart_openlist() {
   start_openlist
 }
 
+create_backup() {
+  local archive
+  local was_running=0
+
+  require_installed || return 1
+
+  if is_running; then
+    was_running=1
+    print_msg "$BLUE" "为保证数据库快照一致，正在临时停止 OpenList..."
+    stop_openlist
+  fi
+
+  archive="$(create_backup_archive "")" || return 1
+  print_msg "$GREEN" "备份完成。"
+  printf "备份文件：%b%s%b\n" "$BLUE" "$archive" "$NC"
+  printf "备份目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
+
+  if [ "$was_running" -eq 1 ]; then
+    print_msg "$BLUE" "正在恢复 OpenList 运行状态..."
+    start_openlist
+  fi
+}
+
+restore_backup() {
+  local input_path archive confirm was_running safety_backup
+  local restore_tmp="$TMP_DIR/restore"
+  local restored_dir
+
+  require_installed || return 1
+  require_cmd "tar" "macOS 通常自带 tar。"
+  prepare_dirs
+
+  input_path="${1:-}"
+  if [ -n "$input_path" ]; then
+    archive="${input_path/#\~/$HOME}"
+  else
+    archive="$(latest_backup_file)"
+    if [ -z "$archive" ]; then
+      print_msg "$RED" "未找到可用备份。"
+      printf "默认备份目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
+      return 1
+    fi
+
+    echo "检测到以下最近备份："
+    ls -1t "$BACKUP_DIR"/openlist-backup-*.tar.gz 2>/dev/null | head -n 5
+    echo
+    prompt_input "回车使用最新备份，或输入要还原的完整备份文件路径: "
+    if [ -n "$REPLY" ]; then
+      archive="${REPLY/#\~/$HOME}"
+    fi
+  fi
+
+  if [ ! -f "$archive" ]; then
+    print_msg "$RED" "备份文件不存在：$archive"
+    return 1
+  fi
+
+  print_msg "$YELLOW" "即将还原备份：$archive"
+  print_msg "$YELLOW" "还原会覆盖当前 OpenList 数据。"
+  prompt_input "确认继续吗？(Y/N，默认为Y): "
+  confirm="$REPLY"
+  if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
+    print_msg "$YELLOW" "已取消还原。"
+    return 0
+  fi
+
+  was_running=0
+  if is_running; then
+    was_running=1
+    print_msg "$BLUE" "正在停止 OpenList..."
+    stop_openlist
+  fi
+
+  print_msg "$BLUE" "正在为当前数据创建安全备份..."
+  safety_backup="$(create_backup_archive "pre-restore")" || return 1
+
+  rm -rf "$restore_tmp"
+  mkdir -p "$restore_tmp"
+  tar -xzf "$archive" -C "$restore_tmp"
+
+  restored_dir="$restore_tmp/$(basename "$DATA_DIR")"
+  if [ ! -d "$restored_dir" ]; then
+    print_msg "$RED" "备份文件内容不符合预期，未找到数据目录。"
+    rm -rf "$restore_tmp"
+    return 1
+  fi
+
+  rm -rf "$DATA_DIR"
+  mkdir -p "$(dirname "$DATA_DIR")"
+  mv "$restored_dir" "$DATA_DIR"
+  rm -rf "$restore_tmp"
+
+  print_msg "$GREEN" "OpenList 数据已还原完成。"
+  printf "已还原备份：%b%s%b\n" "$BLUE" "$archive" "$NC"
+  printf "还原前安全备份：%b%s%b\n" "$BLUE" "$safety_backup" "$NC"
+  printf "备份目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
+
+  if [ "$was_running" -eq 1 ]; then
+    print_msg "$BLUE" "正在恢复 OpenList 运行状态..."
+    start_openlist
+  fi
+}
+
+login_troubleshooting() {
+  local auth_log="$DATA_DIR/log/log.log"
+
+  prepare_dirs
+  print_msg "$YELLOW" "OpenList 官方网页理论上会在登录失败时弹出错误提示。"
+  print_msg "$YELLOW" "如果你这里输入错误用户名或密码后一直转圈，通常不是本脚本卡住，而是浏览器缓存、登录封禁或前端提示没有正常弹出。"
+  echo
+  echo "建议按下面顺序处理："
+  echo "1. 管理员用户名通常是 admin。"
+  echo "2. 如果忘了密码，回主菜单使用“密码管理”。脚本会在重置后自动重启 OpenList，并清除登录封禁。"
+  echo "3. 关闭当前网页后重新打开，或用无痕窗口访问：$DEFAULT_URL"
+  echo "4. 仍然异常时，查看下面的最近登录日志。"
+  echo
+  printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
+  printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
+  echo
+
+  if [ -f "$auth_log" ]; then
+    print_msg "$BLUE" "最近登录相关日志："
+    grep -E '/api/auth/login/hash|/api/auth/login/ldap|/api/me' "$auth_log" | tail -n 12 || true
+  else
+    print_msg "$YELLOW" "暂未找到登录日志。"
+  fi
+}
+
 show_status() {
   local current_version
   local running_pid
+  local latest_backup
 
   cleanup_stale_pid
 
@@ -485,6 +642,13 @@ show_status() {
   fi
 
   printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
+  printf "备份目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
+  latest_backup="$(latest_backup_file)"
+  if [ -n "$latest_backup" ]; then
+    printf "最近备份：%b%s%b\n" "$GREEN" "$latest_backup" "$NC"
+  else
+    printf "最近备份：%b暂无%b\n" "$YELLOW" "$NC"
+  fi
   printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
 }
 
@@ -498,6 +662,7 @@ open_console() {
 
   open "$DEFAULT_URL"
   print_msg "$GREEN" "已使用默认浏览器打开 OpenList 控制台。"
+  print_msg "$BLUE" "如果网页登录一直转圈，可回菜单使用“登录故障排查”或“密码管理”。"
 }
 
 password_menu() {
@@ -545,6 +710,17 @@ run_official_command() {
   prepare_dirs
 
   case "${1:-}" in
+    backup)
+      shift
+      create_backup "$@"
+      ;;
+    restore)
+      shift
+      restore_backup "${1:-}"
+      ;;
+    login-help)
+      login_troubleshooting
+      ;;
     server|admin)
       "$APP_BIN" --data "$DATA_DIR" "$@"
       ;;
@@ -629,6 +805,7 @@ full_uninstall() {
   local confirm
 
   print_msg "$RED" "警告：此操作将删除 OpenList 程序、数据、日志、自启项及本脚本本身。"
+  print_msg "$YELLOW" "位于 $BACKUP_DIR 的备份文件不会自动删除。"
   prompt_input "确认继续吗？(Y/N，默认为Y): "
   confirm="$REPLY"
 
@@ -684,7 +861,10 @@ show_menu() {
   echo "10. 查看实时运行日志"
   echo "11. 设置开机自启"
   echo "12. 取消开机自启"
-  echo "13. 更新脚本"
+  echo "13. 登录故障排查"
+  echo "14. 备份 OpenList 数据"
+  echo "15. 还原 OpenList 数据"
+  echo "16. 更新脚本"
   echo " 0. 退出脚本"
   echo
 }
@@ -713,7 +893,10 @@ while true; do
     10) show_logs ;;
     11) enable_autostart ;;
     12) disable_autostart ;;
-    13) update_script ;;
+    13) login_troubleshooting ;;
+    14) create_backup ;;
+    15) restore_backup ;;
+    16) update_script ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
