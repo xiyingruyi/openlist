@@ -57,6 +57,7 @@ PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
 DEFAULT_URL="http://127.0.0.1:5244"
 BACKUP_DIR="$HOME/OpenList-Backups"
+API_TOKEN_PATH="$MANAGER_DIR/api-token"
 INSTALLER_URL="https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh"
 
 GREEN='\033[0;32m'
@@ -86,6 +87,17 @@ prompt_input() {
 
   printf "%s" "$prompt"
   IFS= read -r REPLY
+}
+
+prompt_secret() {
+  local prompt="$1"
+
+  if [[ -t 0 ]]; then
+    read -rs "REPLY?$prompt"
+    echo
+  else
+    IFS= read -r REPLY
+  fi
 }
 
 prepare_dirs() {
@@ -716,6 +728,286 @@ open_console() {
   print_msg "$BLUE" "如果网页登录一直转圈，可回菜单使用“登录故障排查”或“密码管理”。"
 }
 
+get_api_base_url() {
+  printf 'http://127.0.0.1:%s\n' "$(get_http_port)"
+}
+
+json_escape() {
+  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
+}
+
+sha256_text() {
+  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
+}
+
+api_response_code() {
+  printf '%s\n' "$1" | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1
+}
+
+api_response_message() {
+  local message
+
+  message="$(printf '%s\n' "$1" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  printf '%s\n' "${message:-无返回消息}"
+}
+
+api_response_token() {
+  printf '%s\n' "$1" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
+}
+
+openlist_api_request() {
+  local method="$1"
+  local endpoint="$2"
+  local token="${3:-}"
+  local body="${4:-}"
+  local url response
+
+  url="$(get_api_base_url)$endpoint"
+  if [ -n "$body" ]; then
+    response="$(curl -sS --connect-timeout 5 -X "$method" "$url" \
+      -H "Content-Type: application/json" \
+      -H "Authorization: $token" \
+      --data-binary "$body")" || return 1
+  else
+    response="$(curl -sS --connect-timeout 5 -X "$method" "$url" \
+      -H "Authorization: $token")" || return 1
+  fi
+
+  printf '%s\n' "$response"
+}
+
+is_api_token_valid() {
+  local token="$1"
+  local response code
+
+  [ -n "$token" ] || return 1
+  response="$(openlist_api_request "GET" "/api/me" "$token" "" 2>/dev/null)" || return 1
+  code="$(api_response_code "$response")"
+  [ "$code" = "200" ]
+}
+
+login_openlist_api() {
+  local username password password_hash escaped_username escaped_otp otp_code body response code message token
+
+  require_cmd "curl" "macOS 通常自带 curl。"
+  require_cmd "shasum" "macOS 通常自带 shasum。"
+  require_cmd "awk" "macOS 通常自带 awk。"
+
+  prompt_input "管理员用户名(默认 admin): "
+  username="${REPLY:-admin}"
+
+  if [ -n "${OPENLIST_ADMIN_PASSWORD:-}" ]; then
+    password="$OPENLIST_ADMIN_PASSWORD"
+  else
+    prompt_secret "管理员密码: "
+    password="$REPLY"
+  fi
+
+  if [ -z "$password" ]; then
+    print_msg "$RED" "密码不能为空。"
+    return 1
+  fi
+
+  password_hash="$(sha256_text "$password")"
+  escaped_username="$(json_escape "$username")"
+  body="{\"username\":\"$escaped_username\",\"password\":\"$password_hash\",\"otp_code\":\"\"}"
+  response="$(openlist_api_request "POST" "/api/auth/login/hash" "" "$body")" || {
+    print_msg "$RED" "登录接口请求失败，请确认 OpenList 正在运行。"
+    return 1
+  }
+
+  code="$(api_response_code "$response")"
+  if [ "$code" != "200" ]; then
+    message="$(api_response_message "$response")"
+    if printf '%s\n' "$message" | grep -Eiq 'otp|2fa|totp|验证码'; then
+      prompt_input "请输入 2FA 验证码: "
+      otp_code="$REPLY"
+      escaped_otp="$(json_escape "$otp_code")"
+      body="{\"username\":\"$escaped_username\",\"password\":\"$password_hash\",\"otp_code\":\"$escaped_otp\"}"
+      response="$(openlist_api_request "POST" "/api/auth/login/hash" "" "$body")" || return 1
+      code="$(api_response_code "$response")"
+    fi
+  fi
+
+  if [ "$code" != "200" ]; then
+    message="$(api_response_message "$response")"
+    print_msg "$RED" "管理员登录失败：$message"
+    return 1
+  fi
+
+  token="$(api_response_token "$response")"
+  if [ -z "$token" ]; then
+    print_msg "$RED" "登录成功但没有取得 API token。"
+    return 1
+  fi
+
+  printf '%s\n' "$token" > "$API_TOKEN_PATH"
+  chmod 600 "$API_TOKEN_PATH" 2>/dev/null || true
+  API_TOKEN_RESULT="$token"
+}
+
+get_openlist_api_token() {
+  local token
+  API_TOKEN_RESULT=""
+
+  if [ -n "${OPENLIST_API_TOKEN:-}" ]; then
+    token="$OPENLIST_API_TOKEN"
+    if is_api_token_valid "$token"; then
+      API_TOKEN_RESULT="$token"
+      return 0
+    fi
+  fi
+
+  if [ -f "$API_TOKEN_PATH" ]; then
+    token="$(cat "$API_TOKEN_PATH" 2>/dev/null)"
+    if is_api_token_valid "$token"; then
+      API_TOKEN_RESULT="$token"
+      return 0
+    fi
+  fi
+
+  login_openlist_api
+}
+
+list_enabled_mount_paths() {
+  if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DATA_DIR/data.db" ]; then
+    sqlite3 "$DATA_DIR/data.db" 'select mount_path from x_storages where disabled = 0 order by "order", id;' 2>/dev/null | sed '/^[[:space:]]*$/d'
+    return 0
+  fi
+
+  return 1
+}
+
+show_enabled_mount_paths() {
+  local paths
+
+  paths="$(list_enabled_mount_paths)"
+  if [ -n "$paths" ]; then
+    print_msg "$BLUE" "当前启用的挂载点："
+    printf '%s\n' "$paths"
+    echo
+  fi
+}
+
+reload_all_storages_api() {
+  local token="$1"
+  local response code message
+
+  print_msg "$BLUE" "正在重新加载全部挂载..."
+  response="$(openlist_api_request "POST" "/api/admin/storage/load_all" "$token" "{}")" || {
+    print_msg "$RED" "重新加载挂载失败，请确认 OpenList 正在运行。"
+    return 1
+  }
+
+  code="$(api_response_code "$response")"
+  if [ "$code" = "200" ]; then
+    print_msg "$GREEN" "全部挂载已重新加载。"
+    return 0
+  fi
+
+  message="$(api_response_message "$response")"
+  print_msg "$RED" "重新加载挂载失败：$message"
+  return 1
+}
+
+refresh_fs_path_api() {
+  local token="$1"
+  local target_path="$2"
+  local escaped_path response code message body
+
+  escaped_path="$(json_escape "$target_path")"
+  body="{\"path\":\"$escaped_path\",\"password\":\"\",\"page\":1,\"per_page\":1,\"refresh\":true}"
+  response="$(openlist_api_request "POST" "/api/fs/list" "$token" "$body")" || {
+    print_msg "$RED" "刷新目录失败，请确认 OpenList 正在运行。"
+    return 1
+  }
+
+  code="$(api_response_code "$response")"
+  if [ "$code" = "200" ]; then
+    print_msg "$GREEN" "已刷新：$target_path"
+    return 0
+  fi
+
+  message="$(api_response_message "$response")"
+  print_msg "$RED" "刷新失败：$target_path，原因：$message"
+  return 1
+}
+
+refresh_all_mount_roots() {
+  local token="$1"
+  local paths path ok fail
+  local -a mount_paths
+
+  paths="$(list_enabled_mount_paths)"
+  if [ -z "$paths" ]; then
+    print_msg "$YELLOW" "没有从本地数据库读到启用的挂载点。"
+    print_msg "$BLUE" "请先确认网页后台里已有启用的挂载云盘。"
+    return 1
+  fi
+
+  mount_paths=("${(@f)paths}")
+  ok=0
+  fail=0
+  for path in "${mount_paths[@]}"; do
+    refresh_fs_path_api "$token" "$path"
+    if [ "$?" -eq 0 ]; then
+      ((ok++))
+    else
+      ((fail++))
+    fi
+  done
+
+  echo
+  printf "刷新结果：%b成功 %s 个%b，%b失败 %s 个%b\n" "$GREEN" "$ok" "$NC" "$RED" "$fail" "$NC"
+  if [ "$fail" -gt 0 ]; then
+    print_msg "$YELLOW" "如果某个挂载授权过期，可到网页后台重新授权后再刷新。"
+    return 1
+  fi
+}
+
+refresh_all_storage_content() {
+  local token="$1"
+  local result=0
+
+  reload_all_storages_api "$token" || result=1
+  refresh_all_mount_roots "$token" || result=1
+  print_msg "$BLUE" "已对所有启用挂载执行刷新，不需要输入具体目录。"
+  return "$result"
+}
+
+refresh_storage_content() {
+  local target_path token arg
+
+  require_installed || return 1
+  require_cmd "curl" "macOS 通常自带 curl。"
+
+  if ! get_running_pid >/dev/null 2>&1; then
+    print_msg "$YELLOW" "OpenList 尚未运行，正在自动启动..."
+    start_openlist || return 1
+  fi
+
+  get_openlist_api_token || return 1
+  token="$API_TOKEN_RESULT"
+  arg="${1:-}"
+
+  if [ -n "$arg" ]; then
+    case "$arg" in
+      reload|load-all|--reload)
+        reload_all_storages_api "$token"
+        ;;
+      *)
+        for target_path in "$@"; do
+          refresh_fs_path_api "$token" "$target_path"
+        done
+        ;;
+    esac
+    return $?
+  fi
+
+  show_enabled_mount_paths
+  refresh_all_storage_content "$token"
+}
+
 password_menu() {
   local choice new_pass
 
@@ -774,6 +1066,10 @@ run_official_command() {
       ;;
     delete-backups)
       delete_backups
+      ;;
+    refresh)
+      shift
+      refresh_storage_content "$@"
       ;;
     login-help)
       login_troubleshooting
@@ -924,6 +1220,7 @@ show_menu() {
   echo "16. 清空日志目录"
   echo "17. 删除整个备份目录"
   echo "18. 更新脚本"
+  echo "19. 刷新全部云盘挂载内容"
   echo " 0. 退出脚本"
   echo
 }
@@ -958,6 +1255,7 @@ while true; do
     16) clear_logs ;;
     17) delete_backups ;;
     18) update_script ;;
+    19) refresh_storage_content ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
