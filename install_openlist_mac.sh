@@ -786,6 +786,18 @@ is_api_token_valid() {
   [ "$code" = "200" ]
 }
 
+get_admin_token_from_cli() {
+  local output token
+
+  output="$("$APP_BIN" --data "$DATA_DIR" admin token 2>/dev/null)" || return 1
+  token="$(printf '%s\n' "$output" | sed -n 's/^Admin token:[[:space:]]*//p' | tail -n 1)"
+  [ -n "$token" ] || return 1
+
+  API_TOKEN_RESULT="$token"
+  printf '%s\n' "$token" > "$API_TOKEN_PATH"
+  chmod 600 "$API_TOKEN_PATH" 2>/dev/null || true
+}
+
 login_openlist_api() {
   local username password password_hash escaped_username escaped_otp otp_code body response code message token
 
@@ -866,6 +878,10 @@ get_openlist_api_token() {
     fi
   fi
 
+  if get_admin_token_from_cli && is_api_token_valid "$API_TOKEN_RESULT"; then
+    return 0
+  fi
+
   login_openlist_api
 }
 
@@ -935,10 +951,15 @@ refresh_fs_path_api() {
 
 refresh_all_mount_roots() {
   local token="$1"
-  local paths path ok fail
+  local provided_paths="${2:-}"
+  local paths mount_path ok fail
   local -a mount_paths
 
-  paths="$(list_enabled_mount_paths)"
+  paths="$provided_paths"
+  if [ -z "$paths" ]; then
+    paths="$(list_enabled_mount_paths)"
+  fi
+
   if [ -z "$paths" ]; then
     print_msg "$YELLOW" "没有从本地数据库读到启用的挂载点。"
     print_msg "$BLUE" "请先确认网页后台里已有启用的挂载云盘。"
@@ -948,8 +969,8 @@ refresh_all_mount_roots() {
   mount_paths=("${(@f)paths}")
   ok=0
   fail=0
-  for path in "${mount_paths[@]}"; do
-    refresh_fs_path_api "$token" "$path"
+  for mount_path in "${mount_paths[@]}"; do
+    refresh_fs_path_api "$token" "$mount_path"
     if [ "$?" -eq 0 ]; then
       ((ok++))
     else
@@ -967,10 +988,16 @@ refresh_all_mount_roots() {
 
 refresh_all_storage_content() {
   local token="$1"
+  local paths
   local result=0
 
-  reload_all_storages_api "$token" || result=1
-  refresh_all_mount_roots "$token" || result=1
+  paths="$(list_enabled_mount_paths)"
+  if reload_all_storages_api "$token"; then
+    sleep 1
+  else
+    result=1
+  fi
+  refresh_all_mount_roots "$token" "$paths" || result=1
   print_msg "$BLUE" "已对所有启用挂载执行刷新，不需要输入具体目录。"
   return "$result"
 }
@@ -1211,16 +1238,15 @@ show_menu() {
   echo " 7. 启动 OpenList"
   echo " 8. 停止 OpenList"
   echo " 9. 重启 OpenList"
-  echo "10. 查看实时运行日志"
-  echo "11. 设置开机自启"
-  echo "12. 取消开机自启"
-  echo "13. 登录故障排查"
-  echo "14. 备份 OpenList 数据"
-  echo "15. 还原 OpenList 数据"
-  echo "16. 清空日志目录"
-  echo "17. 删除整个备份目录"
-  echo "18. 更新脚本"
-  echo "19. 刷新全部云盘挂载内容"
+  echo "10. 设置开机自启"
+  echo "11. 取消开机自启"
+  echo "12. 登录故障排查"
+  echo "13. 备份 OpenList 数据"
+  echo "14. 还原 OpenList 数据"
+  echo "15. 清空日志目录"
+  echo "16. 删除整个备份目录"
+  echo "17. 更新脚本"
+  echo "18. 刷新全部云盘挂载内容"
   echo " 0. 退出脚本"
   echo
 }
@@ -1246,21 +1272,20 @@ while true; do
     7) start_openlist ;;
     8) stop_openlist ;;
     9) restart_openlist ;;
-    10) show_logs ;;
-    11) enable_autostart ;;
-    12) disable_autostart ;;
-    13) login_troubleshooting ;;
-    14) create_backup ;;
-    15) restore_backup ;;
-    16) clear_logs ;;
-    17) delete_backups ;;
-    18) update_script ;;
-    19) refresh_storage_content ;;
+    10) enable_autostart ;;
+    11) disable_autostart ;;
+    12) login_troubleshooting ;;
+    13) create_backup ;;
+    14) restore_backup ;;
+    15) clear_logs ;;
+    16) delete_backups ;;
+    17) update_script ;;
+    18) refresh_storage_content ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
 
-  if [ "$choice" != "0" ] && [ "$choice" != "3" ] && [ "$choice" != "10" ]; then
+  if [ "$choice" != "0" ] && [ "$choice" != "3" ]; then
     pause
   fi
 done

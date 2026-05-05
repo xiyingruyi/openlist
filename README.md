@@ -23,7 +23,6 @@ openlist
 - 启动 OpenList
 - 停止 OpenList
 - 重启 OpenList
-- 查看实时运行日志
 - 设置开机自启
 - 取消开机自启
 - 刷新全部云盘挂载内容
@@ -67,7 +66,7 @@ openlist
 
 1. 打开终端
 2. 输入 `openlist`
-3. 选择 `19. 刷新全部云盘挂载内容`
+3. 选择 `18. 刷新全部云盘挂载内容`
 
 也可以直接用命令：
 
@@ -81,7 +80,7 @@ openlist refresh
 openlist refresh reload
 ```
 
-`openlist refresh` 会直接刷新所有启用的挂载云盘，不需要输入具体目录。第一次刷新需要输入管理员用户名和密码来获取本地 API token。脚本只会缓存 token 到 `~/.openlist-manager/api-token`，不会保存明文密码。
+`openlist refresh` 会直接刷新所有启用的挂载云盘，不需要输入具体目录，也不需要输入网页账号密码。脚本会通过本机 OpenList 程序读取管理员 API token，并缓存到 `~/.openlist-manager/api-token`。
 
 ## 脚本会做什么
 
