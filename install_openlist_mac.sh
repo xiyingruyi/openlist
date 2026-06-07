@@ -891,34 +891,8 @@ refresh_all_mount_roots() {
 
 refresh_all_storage_content() {
   local token="$1"
-  local paths
-  local reload_ok=0
-  local result=0
 
-  # 先获取挂载点列表（reload 前，防止 reload 后挂载情况发生变化）
-  paths="$(list_enabled_mount_paths)"
-
-  # 第一步：重新加载所有存储（这一步即使无挂载点也应执行）
-  if reload_all_storages_api "$token"; then
-    reload_ok=1
-    sleep 1
-  else
-    result=1
-  fi
-
-  # 第二步：对各挂载点根目录分别刷新缓存
-  if [ -n "$paths" ]; then
-    refresh_all_mount_roots "$token" "$paths" || result=1
-  else
-    if [ "$reload_ok" -eq 1 ]; then
-      print_msg "$YELLOW" "未在本地数据库中读到已启用的挂载点，已跳过逐目录刷新步骤。"
-      print_msg "$BLUE" "如需刷新目录缓存，请先到网页后台配置并启用云盘挂载。"
-    else
-      result=1
-    fi
-  fi
-
-  return "$result"
+  refresh_all_mount_roots "$token"
 }
 
 refresh_storage_content() {
