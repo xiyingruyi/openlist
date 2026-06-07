@@ -891,8 +891,28 @@ refresh_all_mount_roots() {
 
 refresh_all_storage_content() {
   local token="$1"
+  local paths
+  local result=0
 
-  refresh_all_mount_roots "$token"
+  # 先获取挂载点列表，再 load_all，避免 reload 期间挂载情况变化
+  paths="$(list_enabled_mount_paths)"
+
+  # 第一步：让 OpenList 重新连接夸克并拉取最新数据
+  if reload_all_storages_api "$token"; then
+    sleep 1
+  else
+    result=1
+  fi
+
+  # 第二步：清除各挂载点目录缓存，使网页端立即看到新文件
+  if [ -n "$paths" ]; then
+    refresh_all_mount_roots "$token" "$paths" || result=1
+  else
+    print_msg "$YELLOW" "未在本地数据库中读到已启用的挂载点，已跳过目录缓存刷新。"
+    print_msg "$BLUE" "请先到网页后台配置并启用云盘挂载。"
+  fi
+
+  return "$result"
 }
 
 refresh_storage_content() {
