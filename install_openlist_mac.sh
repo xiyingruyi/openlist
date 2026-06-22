@@ -6,6 +6,7 @@ MANAGER_DIR="$HOME/.openlist-manager"
 MANAGER_PATH="$MANAGER_DIR/openlist-menu.sh"
 
 mkdir -p "$MANAGER_DIR"
+rm -f "$MANAGER_DIR/api-token" 2>/dev/null || true
 
 remove_legacy_entry() {
   for legacy in "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist"; do
@@ -56,8 +57,6 @@ DATA_LOG_DIR="$DATA_DIR/log"
 PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
 DEFAULT_URL="http://127.0.0.1:5244"
-BACKUP_DIR="$HOME/OpenList-Backups"
-API_TOKEN_PATH="$MANAGER_DIR/api-token"
 INSTALLER_URL="https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh"
 
 GREEN='\033[0;32m'
@@ -89,19 +88,8 @@ prompt_input() {
   IFS= read -r REPLY
 }
 
-prompt_secret() {
-  local prompt="$1"
-
-  if [[ -t 0 ]]; then
-    read -rs "REPLY?$prompt"
-    echo
-  else
-    IFS= read -r REPLY
-  fi
-}
-
 prepare_dirs() {
-  mkdir -p "$MANAGER_DIR" "$APP_DIR" "$TMP_DIR" "$DATA_DIR" "$RUN_DIR" "$LOG_DIR" "$BACKUP_DIR"
+  mkdir -p "$MANAGER_DIR" "$APP_DIR" "$TMP_DIR" "$DATA_DIR" "$RUN_DIR" "$LOG_DIR"
 }
 
 require_cmd() {
@@ -180,7 +168,7 @@ EOFV
 }
 
 is_version_newer() {
-  [[ "$(version_to_sort_key "$1")" > "$(version_to_sort_key "$2")" ]]
+  [ "$(version_to_sort_key "$1")" '>' "$(version_to_sort_key "$2")" ]
 }
 
 require_installed() {
@@ -188,33 +176,6 @@ require_installed() {
     print_msg "$RED" "未检测到 OpenList，请先安装。"
     return 1
   fi
-}
-
-latest_backup_file() {
-  ls -1t "$BACKUP_DIR"/openlist-backup-*.tar.gz 2>/dev/null | head -n 1
-}
-
-create_backup_archive() {
-  local prefix="$1"
-  local timestamp archive
-
-  command -v tar >/dev/null 2>&1 || { print_msg "$RED" "缺少命令：tar，macOS 通常自带 tar。" >&2; return 1; }
-  prepare_dirs
-
-  if [ ! -d "$DATA_DIR" ]; then
-    print_msg "$RED" "未找到 OpenList 数据目录：$DATA_DIR" >&2
-    return 1
-  fi
-
-  timestamp="$(date '+%Y%m%d-%H%M%S')"
-  if [ -n "$prefix" ]; then
-    archive="$BACKUP_DIR/openlist-backup-${prefix}-${timestamp}.tar.gz"
-  else
-    archive="$BACKUP_DIR/openlist-backup-${timestamp}.tar.gz"
-  fi
-
-  tar -czf "$archive" -C "$(dirname "$DATA_DIR")" "$(basename "$DATA_DIR")"
-  printf '%s\n' "$archive"
 }
 
 is_running() {
@@ -435,17 +396,12 @@ start_openlist() {
     nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
     echo $! > "$PID_PATH"
   fi
+  sleep 2
 
-  local _w
-  for _w in 1 2 3 4 5; do
-    sleep 1
-    running_pid="$(get_running_pid 2>/dev/null || true)"
-    [ -n "$running_pid" ] && break
-  done
-
+  running_pid="$(get_running_pid 2>/dev/null || true)"
   if [ -n "$running_pid" ]; then
     print_msg "$GREEN" "OpenList 启动成功。"
-    printf "访问地址：%b%s%b\n" "$BLUE" "$(get_api_base_url)" "$NC"
+    printf "访问地址：%b%s%b\n" "$BLUE" "$DEFAULT_URL" "$NC"
     if [ "$first_run" -eq 1 ]; then
       sleep 1
       show_initial_password
@@ -496,26 +452,28 @@ restart_openlist() {
   start_openlist
 }
 
-create_backup() {
-  local archive
-  local was_running=0
+login_troubleshooting() {
+  local auth_log="$DATA_LOG_DIR/log.log"
 
-  require_installed || return 1
+  prepare_dirs
+  print_msg "$YELLOW" "OpenList 官方网页理论上会在登录失败时弹出错误提示。"
+  print_msg "$YELLOW" "如果你这里输入错误用户名或密码后一直转圈，通常不是本脚本卡住，而是浏览器缓存、登录封禁或前端提示没有正常弹出。"
+  echo
+  echo "建议按下面顺序处理："
+  echo "1. 管理员用户名通常是 admin。"
+  echo "2. 如果忘了密码，回主菜单使用“密码管理”。脚本会在重置后自动重启 OpenList，并清除登录封禁。"
+  echo "3. 关闭当前网页后重新打开，或用无痕窗口访问：$DEFAULT_URL"
+  echo "4. 仍然异常时，查看下面的最近登录日志。"
+  echo
+  printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
+  printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
+  echo
 
-  if is_running; then
-    was_running=1
-    print_msg "$BLUE" "为保证数据库快照一致，正在临时停止 OpenList..."
-    stop_openlist
-  fi
-
-  archive="$(create_backup_archive "")" || return 1
-  print_msg "$GREEN" "备份完成。"
-  printf "备份文件：%b%s%b\n" "$BLUE" "$archive" "$NC"
-  printf "备份目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
-
-  if [ "$was_running" -eq 1 ]; then
-    print_msg "$BLUE" "正在恢复 OpenList 运行状态..."
-    start_openlist
+  if [ -f "$auth_log" ]; then
+    print_msg "$BLUE" "最近登录相关日志："
+    grep -E '/api/auth/login/hash|/api/auth/login/ldap|/api/me' "$auth_log" | tail -n 12 || true
+  else
+    print_msg "$YELLOW" "暂未找到登录日志。"
   fi
 }
 
@@ -546,33 +504,9 @@ clear_logs() {
   fi
 }
 
-delete_backups() {
-  local confirm
-
-  if [ ! -d "$BACKUP_DIR" ]; then
-    print_msg "$YELLOW" "当前没有备份目录可删除。"
-    return 0
-  fi
-
-  print_msg "$RED" "警告：此操作将删除整个备份目录及其中所有备份文件。"
-  printf "目标目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
-  prompt_input "确认继续吗？(Y/N，默认为N): "
-  confirm="$REPLY"
-
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
-    print_msg "$YELLOW" "已取消删除备份目录。"
-    return 0
-  fi
-
-  rm -rf "$BACKUP_DIR"
-  print_msg "$GREEN" "备份目录已删除完成。"
-  printf "已删除：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
-}
-
 show_status() {
   local current_version
   local running_pid
-  local latest_backup
 
   cleanup_stale_pid
 
@@ -592,7 +526,7 @@ show_status() {
   running_pid="$(get_running_pid 2>/dev/null || true)"
   if [ -n "$running_pid" ]; then
     printf "运行状态：%b运行中%b\n" "$GREEN" "$NC"
-    printf "访问地址：%b%s%b\n" "$BLUE" "$(get_api_base_url)" "$NC"
+    printf "访问地址：%b%s%b\n" "$BLUE" "$DEFAULT_URL" "$NC"
     printf "进程 PID：%b%s%b\n" "$GREEN" "$running_pid" "$NC"
   else
     printf "运行状态：%b已停止%b\n" "$RED" "$NC"
@@ -605,19 +539,10 @@ show_status() {
   fi
 
   printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
-  printf "备份目录：%b%s%b\n" "$BLUE" "$BACKUP_DIR" "$NC"
-  latest_backup="$(latest_backup_file)"
-  if [ -n "$latest_backup" ]; then
-    printf "最近备份：%b%s%b\n" "$GREEN" "$latest_backup" "$NC"
-  else
-    printf "最近备份：%b暂无%b\n" "$YELLOW" "$NC"
-  fi
   printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
 }
 
 open_console() {
-  local actual_url
-
   require_cmd "open" "macOS 自带 open 命令。"
 
   if ! get_running_pid >/dev/null 2>&1; then
@@ -625,327 +550,9 @@ open_console() {
     start_openlist || return 1
   fi
 
-  actual_url="$(get_api_base_url)"
-  open "$actual_url"
+  open "$DEFAULT_URL"
   print_msg "$GREEN" "已使用默认浏览器打开 OpenList 控制台。"
-  printf "访问地址：%b%s%b\n" "$BLUE" "$actual_url" "$NC"
-  print_msg "$BLUE" "如果网页登录一直转圈，可回菜单使用“密码管理”重置密码。"
-}
-
-get_api_base_url() {
-  printf 'http://127.0.0.1:%s\n' "$(get_http_port)"
-}
-
-json_escape() {
-  printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-sha256_text() {
-  printf '%s' "$1" | shasum -a 256 | awk '{print $1}'
-}
-
-api_response_code() {
-  printf '%s\n' "$1" | sed -n 's/.*"code"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n 1
-}
-
-api_response_message() {
-  local message
-
-  message="$(printf '%s\n' "$1" | sed -n 's/.*"message"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
-  printf '%s\n' "${message:-无返回消息}"
-}
-
-api_response_token() {
-  printf '%s\n' "$1" | sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1
-}
-
-openlist_api_request() {
-  local method="$1"
-  local endpoint="$2"
-  local token="${3:-}"
-  local body="${4:-}"
-  local url response
-
-  url="$(get_api_base_url)$endpoint"
-  if [ -n "$body" ]; then
-    response="$(curl -sS --connect-timeout 5 -X "$method" "$url" \
-      -H "Content-Type: application/json" \
-      -H "Authorization: $token" \
-      --data-binary "$body")" || return 1
-  else
-    response="$(curl -sS --connect-timeout 5 -X "$method" "$url" \
-      -H "Authorization: $token")" || return 1
-  fi
-
-  printf '%s\n' "$response"
-}
-
-is_api_token_valid() {
-  local token="$1"
-  local response code
-
-  [ -n "$token" ] || return 1
-  response="$(openlist_api_request "GET" "/api/me" "$token" "" 2>/dev/null)" || return 1
-  code="$(api_response_code "$response")"
-  [ "$code" = "200" ]
-}
-
-get_admin_token_from_cli() {
-  local output token
-
-  output="$("$APP_BIN" --data "$DATA_DIR" admin token 2>/dev/null)" || return 1
-  token="$(printf '%s\n' "$output" | sed -n 's/^Admin token:[[:space:]]*//p' | tail -n 1)"
-  [ -n "$token" ] || return 1
-
-  API_TOKEN_RESULT="$token"
-  printf '%s\n' "$token" > "$API_TOKEN_PATH"
-  chmod 600 "$API_TOKEN_PATH" 2>/dev/null || true
-}
-
-login_openlist_api() {
-  local username password password_hash escaped_username escaped_otp otp_code body response code message token
-
-  require_cmd "curl" "macOS 通常自带 curl。"
-  require_cmd "shasum" "macOS 通常自带 shasum。"
-  require_cmd "awk" "macOS 通常自带 awk。"
-
-  prompt_input "管理员用户名(默认 admin): "
-  username="${REPLY:-admin}"
-
-  if [ -n "${OPENLIST_ADMIN_PASSWORD:-}" ]; then
-    password="$OPENLIST_ADMIN_PASSWORD"
-  else
-    prompt_secret "管理员密码: "
-    password="$REPLY"
-  fi
-
-  if [ -z "$password" ]; then
-    print_msg "$RED" "密码不能为空。"
-    return 1
-  fi
-
-  password_hash="$(sha256_text "$password")"
-  escaped_username="$(json_escape "$username")"
-  body="{\"username\":\"$escaped_username\",\"password\":\"$password_hash\",\"otp_code\":\"\"}"
-  response="$(openlist_api_request "POST" "/api/auth/login/hash" "" "$body")" || {
-    print_msg "$RED" "登录接口请求失败，请确认 OpenList 正在运行。"
-    return 1
-  }
-
-  code="$(api_response_code "$response")"
-  if [ "$code" != "200" ]; then
-    message="$(api_response_message "$response")"
-    if printf '%s\n' "$message" | grep -Eiq 'otp|2fa|totp|验证码'; then
-      prompt_input "请输入 2FA 验证码: "
-      otp_code="$REPLY"
-      escaped_otp="$(json_escape "$otp_code")"
-      body="{\"username\":\"$escaped_username\",\"password\":\"$password_hash\",\"otp_code\":\"$escaped_otp\"}"
-      response="$(openlist_api_request "POST" "/api/auth/login/hash" "" "$body")" || return 1
-      code="$(api_response_code "$response")"
-    fi
-  fi
-
-  if [ "$code" != "200" ]; then
-    message="$(api_response_message "$response")"
-    print_msg "$RED" "管理员登录失败：$message"
-    return 1
-  fi
-
-  token="$(api_response_token "$response")"
-  if [ -z "$token" ]; then
-    print_msg "$RED" "登录成功但没有取得 API token。"
-    return 1
-  fi
-
-  printf '%s\n' "$token" > "$API_TOKEN_PATH"
-  chmod 600 "$API_TOKEN_PATH" 2>/dev/null || true
-  API_TOKEN_RESULT="$token"
-}
-
-get_openlist_api_token() {
-  local token
-  API_TOKEN_RESULT=""
-
-  if [ -n "${OPENLIST_API_TOKEN:-}" ]; then
-    token="$OPENLIST_API_TOKEN"
-    if is_api_token_valid "$token"; then
-      API_TOKEN_RESULT="$token"
-      return 0
-    fi
-  fi
-
-  if [ -f "$API_TOKEN_PATH" ]; then
-    token="$(cat "$API_TOKEN_PATH" 2>/dev/null)"
-    if is_api_token_valid "$token"; then
-      API_TOKEN_RESULT="$token"
-      return 0
-    fi
-  fi
-
-  if get_admin_token_from_cli && is_api_token_valid "$API_TOKEN_RESULT"; then
-    return 0
-  fi
-
-  login_openlist_api
-}
-
-list_enabled_mount_paths() {
-  if command -v sqlite3 >/dev/null 2>&1 && [ -f "$DATA_DIR/data.db" ]; then
-    sqlite3 "$DATA_DIR/data.db" 'select mount_path from x_storages where disabled = 0 order by "order", id;' 2>/dev/null | sed '/^[[:space:]]*$/d'
-    return 0
-  fi
-
-  return 1
-}
-
-show_enabled_mount_paths() {
-  local paths
-
-  paths="$(list_enabled_mount_paths)"
-  if [ -n "$paths" ]; then
-    print_msg "$BLUE" "当前启用的挂载点："
-    printf '%s\n' "$paths"
-    echo
-  fi
-}
-
-reload_all_storages_api() {
-  local token="$1"
-  local response code message
-
-  print_msg "$BLUE" "正在重新加载全部挂载..."
-  response="$(openlist_api_request "POST" "/api/admin/storage/load_all" "$token" "")" || {
-    print_msg "$RED" "重新加载挂载失败，请确认 OpenList 正在运行。"
-    return 1
-  }
-
-  code="$(api_response_code "$response")"
-  if [ "$code" = "200" ]; then
-    print_msg "$GREEN" "全部挂载已重新加载。"
-    return 0
-  fi
-
-  message="$(api_response_message "$response")"
-  print_msg "$RED" "重新加载挂载失败：$message"
-  return 1
-}
-
-refresh_fs_path_api() {
-  local token="$1"
-  local target_path="$2"
-  local escaped_path response code message body
-
-  escaped_path="$(json_escape "$target_path")"
-  body="{\"path\":\"$escaped_path\",\"password\":\"\",\"page\":1,\"per_page\":1,\"refresh\":true}"
-  response="$(openlist_api_request "POST" "/api/fs/list" "$token" "$body")" || {
-    print_msg "$RED" "刷新目录失败，请确认 OpenList 正在运行。"
-    return 1
-  }
-
-  code="$(api_response_code "$response")"
-  if [ "$code" = "200" ]; then
-    print_msg "$GREEN" "已刷新：$target_path"
-    return 0
-  fi
-
-  message="$(api_response_message "$response")"
-  print_msg "$RED" "刷新失败：$target_path，原因：$message"
-  return 1
-}
-
-refresh_all_mount_roots() {
-  local token="$1"
-  local provided_paths="${2:-}"
-  local paths mount_path ok fail
-  local -a mount_paths
-
-  paths="$provided_paths"
-  if [ -z "$paths" ]; then
-    paths="$(list_enabled_mount_paths)"
-  fi
-
-  if [ -z "$paths" ]; then
-    print_msg "$YELLOW" "没有从本地数据库读到启用的挂载点。"
-    print_msg "$BLUE" "请先确认网页后台里已有启用的挂载云盘。"
-    return 1
-  fi
-
-  mount_paths=("${(@f)paths}")
-  ok=0
-  fail=0
-  for mount_path in "${mount_paths[@]}"; do
-    if refresh_fs_path_api "$token" "$mount_path"; then
-      ((ok++))
-    else
-      ((fail++))
-    fi
-  done
-
-  echo
-  printf "刷新结果：%b成功 %s 个%b，%b失败 %s 个%b\n" "$GREEN" "$ok" "$NC" "$RED" "$fail" "$NC"
-  if [ "$fail" -gt 0 ]; then
-    print_msg "$YELLOW" "如果某个挂载授权过期，可到网页后台重新授权后再刷新。"
-    return 1
-  fi
-}
-
-refresh_all_storage_content() {
-  local token="$1"
-  local paths
-  local result=0
-
-  # 先获取挂载点列表，再 load_all，避免 reload 期间挂载情况变化
-  paths="$(list_enabled_mount_paths)"
-
-  # 第一步：让 OpenList 重新连接夸克并拉取最新数据
-  if reload_all_storages_api "$token"; then
-    sleep 1
-  else
-    result=1
-  fi
-
-  # 第二步：清除各挂载点目录缓存，使网页端立即看到新文件
-  if [ -n "$paths" ]; then
-    refresh_all_mount_roots "$token" "$paths" || result=1
-  else
-    print_msg "$YELLOW" "未在本地数据库中读到已启用的挂载点，已跳过目录缓存刷新。"
-    print_msg "$BLUE" "请先到网页后台配置并启用云盘挂载。"
-  fi
-
-  return "$result"
-}
-
-refresh_storage_content() {
-  local target_path token arg
-
-  require_installed || return 1
-  require_cmd "curl" "macOS 通常自带 curl。"
-
-  if ! get_running_pid >/dev/null 2>&1; then
-    print_msg "$YELLOW" "OpenList 尚未运行，正在自动启动..."
-    start_openlist || return 1
-  fi
-
-  get_openlist_api_token || return 1
-  token="$API_TOKEN_RESULT"
-  arg="${1:-}"
-
-  if [ -n "$arg" ]; then
-    case "$arg" in
-      reload|load-all|--reload)
-        reload_all_storages_api "$token"
-        ;;
-      *)
-        for target_path in "$@"; do
-          refresh_fs_path_api "$token" "$target_path"
-        done
-        ;;
-    esac
-    return $?
-  fi
-
-  show_enabled_mount_paths
-  refresh_all_storage_content "$token"
+  print_msg "$BLUE" "如果网页登录一直转圈，可回菜单使用“登录故障排查”或“密码管理”。"
 }
 
 password_menu() {
@@ -956,14 +563,10 @@ password_menu() {
 
   echo "1. 随机生成新密码"
   echo "2. 手动设置新密码"
-  echo "0. 返回主菜单"
-  prompt_input "请选择(0/1/2): "
+  prompt_input "请选择(1/2): "
   choice="$REPLY"
 
   case "$choice" in
-    0)
-      return 0
-      ;;
     1)
       "$APP_BIN" --data "$DATA_DIR" admin random
       if is_running; then
@@ -993,23 +596,28 @@ password_menu() {
 }
 
 run_official_command() {
+  case "${1:-}" in
+    backup|restore|delete-backups)
+      print_msg "$YELLOW" "这个脚本已移除该功能：$1"
+      print_msg "$BLUE" "如需保留 OpenList 数据，请直接复制数据目录：$DATA_DIR"
+      return 1
+      ;;
+    refresh)
+      print_msg "$YELLOW" "这个脚本已移除该功能：refresh"
+      print_msg "$BLUE" "如需刷新夸克网盘等内容，请到对应网页端刷新或同步后再回 OpenList 查看。"
+      return 1
+      ;;
+  esac
+
   require_installed || return 1
   prepare_dirs
 
   case "${1:-}" in
-    backup)
-      shift
-      create_backup "$@"
-      ;;
     clear-logs)
       clear_logs
       ;;
-    delete-backups)
-      delete_backups
-      ;;
-    refresh)
-      shift
-      refresh_storage_content "$@"
+    login-help)
+      login_troubleshooting
       ;;
     server|admin)
       "$APP_BIN" --data "$DATA_DIR" "$@"
@@ -1018,13 +626,6 @@ run_official_command() {
       "$APP_BIN" "$@"
       ;;
   esac
-}
-
-show_logs() {
-  prepare_dirs
-  touch "$LOG_PATH"
-  print_msg "$BLUE" "正在显示实时日志，按 Ctrl + C 退出。"
-  tail -f "$LOG_PATH"
 }
 
 write_plist() {
@@ -1095,11 +696,10 @@ full_uninstall() {
   local confirm
 
   print_msg "$RED" "警告：此操作将删除 OpenList 程序、数据、日志、自启项及本脚本本身。"
-  print_msg "$YELLOW" "位于 $BACKUP_DIR 的备份文件不会自动删除。"
-  prompt_input "确认继续吗？(Y/N，默认为N): "
+  prompt_input "确认继续吗？(Y/N，默认为Y): "
   confirm="$REPLY"
 
-  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+  if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
     print_msg "$YELLOW" "已取消卸载。"
     return 0
   fi
@@ -1120,29 +720,15 @@ update_script() {
   temp_installer="$TMP_DIR/install_openlist_mac.sh"
 
   print_msg "$BLUE" "正在从 GitHub 获取最新脚本..."
-  if ! curl -fsSL "$INSTALLER_URL" -o "$temp_installer"; then
-    print_msg "$RED" "下载最新脚本失败，请检查网络连接或脚本地址是否正确。"
-    return 1
-  fi
-
-  if [ ! -s "$temp_installer" ]; then
-    print_msg "$RED" "下载到的脚本文件为空，更新中止。"
-    rm -f "$temp_installer"
-    return 1
-  fi
-
+  curl -fsSL "$INSTALLER_URL" -o "$temp_installer"
   chmod +x "$temp_installer"
 
-  print_msg "$BLUE" "正在应用更新..."
-  if ! OPENLIST_SKIP_MENU_AUTORUN=1 zsh "$temp_installer"; then
-    print_msg "$RED" "脚本安装器执行失败，更新中止。"
-    rm -f "$temp_installer"
-    return 1
-  fi
+  print_msg "$BLUE" "正在更新本地脚本..."
+  OPENLIST_SKIP_MENU_AUTORUN=1 zsh "$temp_installer"
 
-  rm -f "$temp_installer"
-  print_msg "$GREEN" "脚本更新完成，正在重启管理菜单..."
+  print_msg "$GREEN" "脚本更新完成。"
   if [[ -t 0 && -t 1 ]]; then
+    pause
     exec "$MANAGER_PATH"
   fi
   exit 0
@@ -1164,11 +750,9 @@ show_menu() {
   echo " 9. 重启 OpenList"
   echo "10. 设置开机自启"
   echo "11. 取消开机自启"
-  echo "12. 备份 OpenList 数据"
+  echo "12. 登录故障排查"
   echo "13. 清空日志目录"
-  echo "14. 删除整个备份目录"
-  echo "15. 更新脚本"
-  echo "16. 刷新全部云盘挂载内容"
+  echo "14. 更新脚本"
   echo " 0. 退出脚本"
   echo
 }
@@ -1196,11 +780,9 @@ while true; do
     9) restart_openlist ;;
     10) enable_autostart ;;
     11) disable_autostart ;;
-    12) create_backup ;;
+    12) login_troubleshooting ;;
     13) clear_logs ;;
-    14) delete_backups ;;
-    15) update_script ;;
-    16) refresh_storage_content ;;
+    14) update_script ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
