@@ -84,8 +84,9 @@ pause() {
 prompt_input() {
   local prompt="$1"
 
+  REPLY=""
   printf "%s" "$prompt"
-  IFS= read -r REPLY
+  IFS= read -r REPLY || return 1
 }
 
 prepare_dirs() {
@@ -769,7 +770,10 @@ fi
 
 while true; do
   show_menu
-  prompt_input "请输入菜单编号: "
+  if ! prompt_input "请输入菜单编号: "; then
+    echo
+    exit 0
+  fi
   choice="$REPLY"
   clear
 
