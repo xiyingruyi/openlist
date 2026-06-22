@@ -53,7 +53,6 @@ DATA_DIR="$HOME/Library/Application Support/OpenList/data"
 RUN_DIR="$HOME/Library/Application Support/OpenList/run"
 LOG_DIR="$HOME/Library/Logs/OpenList"
 LOG_PATH="$LOG_DIR/openlist.log"
-DATA_LOG_DIR="$DATA_DIR/log"
 PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
 DEFAULT_URL="http://127.0.0.1:5244"
@@ -453,58 +452,6 @@ restart_openlist() {
   start_openlist
 }
 
-login_troubleshooting() {
-  local auth_log="$DATA_LOG_DIR/log.log"
-
-  prepare_dirs
-  print_msg "$YELLOW" "OpenList 官方网页理论上会在登录失败时弹出错误提示。"
-  print_msg "$YELLOW" "如果你这里输入错误用户名或密码后一直转圈，通常不是本脚本卡住，而是浏览器缓存、登录封禁或前端提示没有正常弹出。"
-  echo
-  echo "建议按下面顺序处理："
-  echo "1. 管理员用户名通常是 admin。"
-  echo "2. 如果忘了密码，回主菜单使用“密码管理”。脚本会在重置后自动重启 OpenList，并清除登录封禁。"
-  echo "3. 关闭当前网页后重新打开，或用无痕窗口访问：$DEFAULT_URL"
-  echo "4. 仍然异常时，查看下面的最近登录日志。"
-  echo
-  printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
-  printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
-  echo
-
-  if [ -f "$auth_log" ]; then
-    print_msg "$BLUE" "最近登录相关日志："
-    grep -E '/api/auth/login/hash|/api/auth/login/ldap|/api/me' "$auth_log" | tail -n 12 || true
-  else
-    print_msg "$YELLOW" "暂未找到登录日志。"
-  fi
-}
-
-clear_logs() {
-  local was_running=0
-  local restart_choice=""
-
-  if is_running; then
-    was_running=1
-    print_msg "$BLUE" "OpenList 正在运行，先停止后再清理日志，避免残留正在写入的日志文件。"
-    stop_openlist
-  fi
-
-  rm -rf "$LOG_DIR" "$DATA_LOG_DIR"
-  print_msg "$GREEN" "日志目录已清理完成。"
-  printf "已删除：%b%s%b\n" "$BLUE" "$LOG_DIR" "$NC"
-  printf "已删除：%b%s%b\n" "$BLUE" "$DATA_LOG_DIR" "$NC"
-
-  if [ "$was_running" -eq 1 ]; then
-    echo
-    prompt_input "OpenList 一旦重新启动会重新生成新日志，是否现在就重启？(Y/N，默认为N): "
-    restart_choice="$REPLY"
-    if [[ "$restart_choice" = "y" || "$restart_choice" = "Y" ]]; then
-      start_openlist
-    else
-      print_msg "$YELLOW" "OpenList 当前保持停止状态，避免刚清完日志又立刻生成新日志。"
-    fi
-  fi
-}
-
 show_status() {
   local current_version
   local running_pid
@@ -553,7 +500,7 @@ open_console() {
 
   open "$DEFAULT_URL"
   print_msg "$GREEN" "已使用默认浏览器打开 OpenList 控制台。"
-  print_msg "$BLUE" "如果网页登录一直转圈，可回菜单使用“登录故障排查”或“密码管理”。"
+  print_msg "$BLUE" "如果忘记管理员密码，可回菜单使用“密码管理”。"
 }
 
 password_menu() {
@@ -613,18 +560,17 @@ run_official_command() {
       print_msg "$BLUE" "如需刷新夸克网盘等内容，请到对应网页端刷新或同步后再回 OpenList 查看。"
       return 1
       ;;
+    clear-logs|login-help)
+      print_msg "$YELLOW" "这个脚本已移除该功能：$1"
+      print_msg "$BLUE" "如需查看日志，可在菜单“查看状态”里查看日志路径。"
+      return 1
+      ;;
   esac
 
   require_installed || return 1
   prepare_dirs
 
   case "${1:-}" in
-    clear-logs)
-      clear_logs
-      ;;
-    login-help)
-      login_troubleshooting
-      ;;
     server|admin)
       "$APP_BIN" --data "$DATA_DIR" "$@"
       ;;
@@ -756,9 +702,7 @@ show_menu() {
   echo " 9. 重启 OpenList"
   echo "10. 设置开机自启"
   echo "11. 取消开机自启"
-  echo "12. 登录故障排查"
-  echo "13. 清空日志目录"
-  echo "14. 更新脚本"
+  echo "12. 更新脚本"
   echo " 0. 退出脚本"
   echo
 }
@@ -789,9 +733,7 @@ while true; do
     9) restart_openlist ;;
     10) enable_autostart ;;
     11) disable_autostart ;;
-    12) login_troubleshooting ;;
-    13) clear_logs ;;
-    14) update_script ;;
+    12) update_script ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
