@@ -563,10 +563,15 @@ password_menu() {
 
   echo "1. 随机生成新密码"
   echo "2. 手动设置新密码"
-  prompt_input "请选择(1/2): "
+  echo "0. 返回主菜单"
+  prompt_input "请选择(0/1/2，默认为0): "
   choice="$REPLY"
 
   case "$choice" in
+    ""|0)
+      print_msg "$YELLOW" "已返回主菜单，未修改管理员密码。"
+      return 0
+      ;;
     1)
       "$APP_BIN" --data "$DATA_DIR" admin random
       if is_running; then
@@ -578,8 +583,8 @@ password_menu() {
       prompt_input "请输入新的管理员密码: "
       new_pass="$REPLY"
       if [ -z "$new_pass" ]; then
-        print_msg "$RED" "密码不能为空。"
-        return 1
+        print_msg "$YELLOW" "密码为空，已取消修改。"
+        return 0
       fi
       "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass"
       print_msg "$GREEN" "管理员密码已重置。"
