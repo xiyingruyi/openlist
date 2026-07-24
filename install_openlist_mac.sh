@@ -11,6 +11,7 @@ rm -f "$MANAGER_DIR/api-token" 2>/dev/null || true
 remove_legacy_entry() {
   for legacy in "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist"; do
     if [ -L "$legacy" ] || [ -f "$legacy" ]; then
+      # 仅尝试删除；无权限时跳过并在后面提示
       rm -f "$legacy" 2>/dev/null || true
     fi
   done
@@ -40,8 +41,11 @@ cat > "$MANAGER_PATH" <<'EOF'
 
 set -u
 
+# 本地管理脚本版本（上传 GitHub 后，选「更新脚本」才会同步到别人机器）
+SCRIPT_VERSION="2026.07.24.1"
+
 APP_NAME="OpenList"
-MANAGER_DIR="$HOME/.openlist-manager"
+MANAGER_DIR="${OPENLIST_MANAGER_DIR:-$HOME/.openlist-manager}"
 MANAGER_PATH="$MANAGER_DIR/openlist-menu.sh"
 APP_DIR="$MANAGER_DIR/app"
 TMP_DIR="$MANAGER_DIR/tmp"
@@ -49,14 +53,19 @@ APP_BIN="$APP_DIR/openlist"
 VERSION_FILE="$APP_DIR/version.txt"
 ARCHIVE_PATH="$TMP_DIR/openlist.tar.gz"
 EXTRACT_DIR="$TMP_DIR/extract"
-DATA_DIR="$HOME/Library/Application Support/OpenList/data"
-RUN_DIR="$HOME/Library/Application Support/OpenList/run"
-LOG_DIR="$HOME/Library/Logs/OpenList"
+DATA_DIR="${OPENLIST_DATA_DIR:-$HOME/Library/Application Support/OpenList/data}"
+RUN_DIR="${OPENLIST_RUN_DIR:-$HOME/Library/Application Support/OpenList/run}"
+LOG_DIR="${OPENLIST_LOG_DIR:-$HOME/Library/Logs/OpenList}"
 LOG_PATH="$LOG_DIR/openlist.log"
 PID_PATH="$RUN_DIR/openlist.pid"
-PLIST_PATH="$HOME/Library/LaunchAgents/com.openlist.server.plist"
-DEFAULT_URL="http://127.0.0.1:5244"
+PLIST_PATH="${OPENLIST_PLIST_PATH:-$HOME/Library/LaunchAgents/com.openlist.server.plist}"
 INSTALLER_URL="https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh"
+GITHUB_REPO="OpenListTeam/OpenList"
+GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
+GITHUB_RELEASES="https://github.com/${GITHUB_REPO}/releases"
+# 下载包最小体积（字节），防止半截/空文件当成功
+MIN_ARCHIVE_BYTES=1048576
+CURL_UA="OpenList-macOS-Manager/${SCRIPT_VERSION}"
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -101,6 +110,7 @@ require_cmd() {
     print_msg "$BLUE" "$hint"
     return 1
   fi
+  return 0
 }
 
 detect_arch() {
@@ -117,38 +127,101 @@ detect_arch() {
 download_url() {
   local arch
   arch="$(detect_arch)" || return 1
-  echo "https://github.com/OpenListTeam/OpenList/releases/latest/download/openlist-darwin-${arch}.tar.gz"
+  echo "${GITHUB_RELEASES}/latest/download/openlist-darwin-${arch}.tar.gz"
+}
+
+get_http_port() {
+  local port=""
+
+  if [ -f "$DATA_DIR/config.json" ]; then
+    port="$(sed -n 's/.*"http_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$DATA_DIR/config.json" | head -n 1)"
+  fi
+
+  printf '%s\n' "${port:-5244}"
+}
+
+get_console_url() {
+  printf 'http://127.0.0.1:%s\n' "$(get_http_port)"
 }
 
 normalize_version() {
-  printf '%s\n' "$1" | sed 's/^[Vv]//' | grep -Eo '[0-9]+(\.[0-9]+){1,3}' | head -n 1
+  # 提取 x.y / x.y.z / x.y.z.w
+  printf '%s\n' "$1" | tr -d '\r' | grep -Eo '[0-9]+(\.[0-9]+){1,3}' | head -n 1
 }
 
-get_local_version() {
+# 从二进制读取真实版本（权威来源）
+read_binary_version() {
   local raw
-
-  if [ -f "$VERSION_FILE" ]; then
-    raw="$(cat "$VERSION_FILE" 2>/dev/null)"
-    raw="$(normalize_version "$raw")"
-    if [ -n "$raw" ]; then
-      printf '%s\n' "$raw"
-      return 0
-    fi
-  fi
 
   if [ ! -x "$APP_BIN" ]; then
     return 1
   fi
 
-  raw="$("$APP_BIN" version 2>/dev/null)"
+  raw="$("$APP_BIN" version 2>/dev/null | grep -E '^[[:space:]]*Version:' | head -n 1)"
+  if [ -z "$raw" ]; then
+    raw="$("$APP_BIN" version 2>/dev/null | grep -Ei 'Version:' | grep -vi 'Go Version' | head -n 1)"
+  fi
   normalize_version "$raw"
 }
 
-get_latest_version() {
-  local raw
+write_version_file() {
+  local version="$1"
+  if [ -n "$version" ]; then
+    printf '%s\n' "$version" > "$VERSION_FILE"
+  fi
+}
 
-  require_cmd "curl" "macOS 通常自带 curl。"
-  raw="$(curl -fsSL https://api.github.com/repos/OpenListTeam/OpenList/releases/latest | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+get_local_version() {
+  local bin_ver file_ver
+
+  bin_ver="$(read_binary_version 2>/dev/null || true)"
+  if [ -n "$bin_ver" ]; then
+    # 以二进制为准；version.txt 仅缓存，不一致则回写
+    if [ -f "$VERSION_FILE" ]; then
+      file_ver="$(normalize_version "$(cat "$VERSION_FILE" 2>/dev/null)")"
+      if [ "$file_ver" != "$bin_ver" ]; then
+        write_version_file "$bin_ver"
+      fi
+    else
+      write_version_file "$bin_ver"
+    fi
+    printf '%s\n' "$bin_ver"
+    return 0
+  fi
+
+  if [ -f "$VERSION_FILE" ]; then
+    file_ver="$(normalize_version "$(cat "$VERSION_FILE" 2>/dev/null)")"
+    if [ -n "$file_ver" ]; then
+      printf '%s\n' "$file_ver"
+      return 0
+    fi
+  fi
+
+  return 1
+}
+
+get_latest_version() {
+  local raw=""
+  local http_body
+  local location
+
+  require_cmd "curl" "macOS 通常自带 curl。" || return 1
+
+  # 优先 GitHub API
+  http_body="$(curl -fsSL -A "$CURL_UA" \
+    -H "Accept: application/vnd.github+json" \
+    "${GITHUB_API}/releases/latest" 2>/dev/null || true)"
+  if [ -n "$http_body" ]; then
+    raw="$(printf '%s\n' "$http_body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
+
+  # API 失败时：跟随 latest 跳转，从最终 URL 解析 tag
+  if [ -z "$raw" ]; then
+    location="$(curl -fsSL -A "$CURL_UA" -o /dev/null -w '%{url_effective}' \
+      "${GITHUB_RELEASES}/latest" 2>/dev/null || true)"
+    raw="$(printf '%s\n' "$location" | grep -Eo 'tag/[^/[:space:]]+' | head -n 1 | sed 's|^tag/||')"
+  fi
+
   normalize_version "$raw"
 }
 
@@ -168,7 +241,11 @@ EOFV
 }
 
 is_version_newer() {
-  [ "$(version_to_sort_key "$1")" '>' "$(version_to_sort_key "$2")" ]
+  # zsh 的 [ ] 里 '>' 会被当成重定向，必须用 [[ ]]
+  local newer older
+  newer="$(version_to_sort_key "$1")"
+  older="$(version_to_sort_key "$2")"
+  [[ "$newer" > "$older" ]]
 }
 
 require_installed() {
@@ -182,14 +259,22 @@ is_running() {
   get_running_pid >/dev/null 2>&1
 }
 
-get_http_port() {
-  local port
+is_autostart_configured() {
+  [ -f "$PLIST_PATH" ]
+}
 
-  if [ -f "$DATA_DIR/config.json" ]; then
-    port="$(sed -n 's/.*"http_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$DATA_DIR/config.json" | head -n 1)"
-  fi
+is_autostart_loaded() {
+  launchctl print "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1
+}
 
-  printf '%s\n' "${port:-5244}"
+pid_command_looks_like_openlist() {
+  local pid="$1"
+  local cmd
+
+  [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
+  [[ "$cmd" == *"$APP_BIN"* ]] || [[ "$cmd" == *"/openlist"* ]] || [[ "$cmd" == *" openlist "* ]]
 }
 
 pid_is_openlist_server() {
@@ -197,8 +282,31 @@ pid_is_openlist_server() {
   local http_port
 
   [ -n "$pid" ] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+
   http_port="$(get_http_port)"
-  lsof -nP -a -p "$pid" -iTCP:"$http_port" -sTCP:LISTEN >/dev/null 2>&1
+  if lsof -nP -a -p "$pid" -iTCP:"$http_port" -sTCP:LISTEN >/dev/null 2>&1; then
+    return 0
+  fi
+
+  # 启动中尚未 listen：用命令行兜底
+  pid_command_looks_like_openlist "$pid"
+}
+
+find_pid_by_listen_port() {
+  local http_port
+  local line pid
+
+  http_port="$(get_http_port)"
+  while IFS= read -r line; do
+    pid="$(printf '%s\n' "$line" | awk '{print $2}' | head -n 1)"
+    if pid_command_looks_like_openlist "$pid"; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done < <(lsof -nP -iTCP:"$http_port" -sTCP:LISTEN 2>/dev/null || true)
+
+  return 1
 }
 
 get_launchd_pid() {
@@ -209,13 +317,16 @@ get_launchd_pid() {
   [ -n "$launchd_info" ] || return 1
 
   printf '%s\n' "$launchd_info" | grep -F "state = running" >/dev/null 2>&1 || return 1
-  printf '%s\n' "$launchd_info" | grep -F "program = $APP_BIN" >/dev/null 2>&1 || return 1
-  printf '%s\n' "$launchd_info" | grep -F "$DATA_DIR" >/dev/null 2>&1 || return 1
-  printf '%s\n' "$launchd_info" | grep -F "server" >/dev/null 2>&1 || return 1
 
   pid="$(printf '%s\n' "$launchd_info" | sed -n 's/^[[:space:]]*pid = \([0-9][0-9]*\)$/\1/p' | head -n 1)"
-  pid_is_openlist_server "$pid" || return 1
-  printf '%s\n' "$pid"
+  [ -n "$pid" ] || return 1
+
+  if pid_is_openlist_server "$pid" || pid_command_looks_like_openlist "$pid"; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+
+  return 1
 }
 
 get_running_pid() {
@@ -230,7 +341,15 @@ get_running_pid() {
   fi
 
   pid="$(get_launchd_pid 2>/dev/null || true)"
-  if pid_is_openlist_server "$pid"; then
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+
+  # pid 文件丢失 / 非本脚本拉起：按监听端口反查
+  pid="$(find_pid_by_listen_port 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid" > "$PID_PATH" 2>/dev/null || true
     printf '%s\n' "$pid"
     return 0
   fi
@@ -275,7 +394,10 @@ offer_set_password_now() {
     return 1
   fi
 
-  "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass"
+  "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass" || {
+    print_msg "$RED" "设置密码失败。"
+    return 1
+  }
   print_msg "$GREEN" "管理员密码已更新为你刚输入的新密码。"
   if is_running; then
     print_msg "$BLUE" "正在重启 OpenList，使新密码立即生效并清除登录封禁..."
@@ -283,14 +405,37 @@ offer_set_password_now() {
   fi
 }
 
-download_and_install() {
-  local url found_bin latest_version
+curl_download() {
+  local url="$1"
+  local dest="$2"
 
-  require_cmd "curl" "macOS 通常自带 curl。"
-  require_cmd "tar" "macOS 通常自带 tar。"
+  require_cmd "curl" "macOS 通常自带 curl。" || return 1
+
+  # 终端下显示进度；非交互静默
+  if [[ -t 1 ]]; then
+    curl -fL --connect-timeout 20 --retry 2 --retry-delay 2 \
+      -A "$CURL_UA" --progress-bar "$url" -o "$dest"
+  else
+    curl -fL --connect-timeout 20 --retry 2 --retry-delay 2 \
+      -A "$CURL_UA" -sS "$url" -o "$dest"
+  fi
+}
+
+download_and_install() {
+  local url found_bin latest_version was_running archive_size
+  local staged_bin
+
+  # 可选参数：已查好的最新版本，避免重复打 API
+  latest_version="${1:-}"
+
+  require_cmd "curl" "macOS 通常自带 curl。" || return 1
+  require_cmd "tar" "macOS 通常自带 tar。" || return 1
+  require_cmd "find" "macOS 通常自带 find。" || return 1
   prepare_dirs
 
-  latest_version="$(get_latest_version)"
+  if [ -z "$latest_version" ]; then
+    latest_version="$(get_latest_version)" || true
+  fi
   url="$(download_url)" || return 1
 
   if [ -z "$latest_version" ]; then
@@ -298,29 +443,92 @@ download_and_install() {
     return 1
   fi
 
-  print_msg "$BLUE" "正在从 OpenList 官方发布页下载最新版本..."
+  was_running=0
+  if is_running; then
+    was_running=1
+  fi
+
+  print_msg "$BLUE" "正在从 OpenList 官方发布页下载 ${latest_version} ..."
   rm -rf "$EXTRACT_DIR"
   mkdir -p "$EXTRACT_DIR"
-  curl -fL "$url" -o "$ARCHIVE_PATH"
+  rm -f "$ARCHIVE_PATH"
 
-  print_msg "$BLUE" "正在解压安装包..."
-  tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"
+  if ! curl_download "$url" "$ARCHIVE_PATH"; then
+    print_msg "$RED" "下载失败，请检查网络后重试。"
+    rm -f "$ARCHIVE_PATH"
+    return 1
+  fi
+
+  if [ ! -f "$ARCHIVE_PATH" ]; then
+    print_msg "$RED" "下载失败：未找到安装包文件。"
+    return 1
+  fi
+
+  archive_size="$(wc -c < "$ARCHIVE_PATH" | tr -d '[:space:]')"
+  if [ -z "$archive_size" ] || [ "$archive_size" -lt "$MIN_ARCHIVE_BYTES" ]; then
+    print_msg "$RED" "下载文件异常（大小 ${archive_size:-0} 字节），已中止安装。"
+    rm -f "$ARCHIVE_PATH"
+    return 1
+  fi
+
+  print_msg "$BLUE" "正在解压安装包（${archive_size} 字节）..."
+  if ! tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"; then
+    print_msg "$RED" "解压失败，安装包可能损坏。"
+    rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
+    return 1
+  fi
 
   found_bin="$(find "$EXTRACT_DIR" -type f \( -name 'openlist' -o -name 'OpenList' \) | head -n 1)"
-  if [ -z "$found_bin" ]; then
+  if [ -z "$found_bin" ] || [ ! -f "$found_bin" ]; then
     print_msg "$RED" "解压后未找到 OpenList 可执行文件。"
+    rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
     return 1
   fi
 
   stop_openlist >/dev/null 2>&1 || true
 
-  rm -f "$APP_BIN"
-  cp "$found_bin" "$APP_BIN"
-  chmod +x "$APP_BIN"
-  printf '%s\n' "$latest_version" > "$VERSION_FILE"
+  # 原子替换：先写到临时文件再 mv
+  staged_bin="${APP_BIN}.new"
+  rm -f "$staged_bin"
+  if ! cp "$found_bin" "$staged_bin"; then
+    print_msg "$RED" "复制可执行文件失败。"
+    rm -f "$staged_bin"
+    rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
+    return 1
+  fi
+  chmod +x "$staged_bin"
+  # 去掉隔离属性，减少 Gatekeeper 拦启动
+  xattr -dr com.apple.quarantine "$staged_bin" 2>/dev/null || true
+  if ! mv -f "$staged_bin" "$APP_BIN"; then
+    print_msg "$RED" "替换可执行文件失败。"
+    rm -f "$staged_bin"
+    rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
+    return 1
+  fi
+  xattr -dr com.apple.quarantine "$APP_BIN" 2>/dev/null || true
+
+  write_version_file "$latest_version"
   rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
 
-  print_msg "$GREEN" "OpenList 安装/更新完成。当前版本：$latest_version"
+  # 再校验一次二进制自报版本
+  local actual
+  actual="$(read_binary_version 2>/dev/null || true)"
+  if [ -n "$actual" ]; then
+    write_version_file "$actual"
+    print_msg "$GREEN" "OpenList 安装/更新完成。当前版本：$actual"
+  else
+    print_msg "$GREEN" "OpenList 安装/更新完成。当前版本：$latest_version"
+  fi
+
+  if [ "$was_running" -eq 1 ]; then
+    print_msg "$BLUE" "更新前服务在运行，正在重新启动..."
+    start_openlist || {
+      print_msg "$YELLOW" "自动重启失败，请在菜单手动选择「启动 OpenList」。"
+      return 1
+    }
+  fi
+
+  return 0
 }
 
 install_openlist() {
@@ -334,7 +542,7 @@ install_openlist() {
 }
 
 update_openlist() {
-  local local_version latest_version
+  local local_version latest_version force_choice
 
   if [ ! -x "$APP_BIN" ]; then
     print_msg "$YELLOW" "当前未安装 OpenList，先执行安装。"
@@ -342,12 +550,12 @@ update_openlist() {
     return
   fi
 
-  local_version="$(get_local_version)"
-  latest_version="$(get_latest_version)"
+  local_version="$(get_local_version || true)"
+  latest_version="$(get_latest_version || true)"
 
   if [ -z "$local_version" ]; then
     print_msg "$YELLOW" "未能识别当前本地版本，将直接尝试更新。"
-    download_and_install
+    download_and_install "$latest_version"
     return
   fi
 
@@ -361,20 +569,31 @@ update_openlist() {
 
   if is_version_newer "$latest_version" "$local_version"; then
     print_msg "$YELLOW" "检测到官方有更新，正在升级..."
-    download_and_install
+    download_and_install "$latest_version"
+    return
+  fi
+
+  print_msg "$GREEN" "当前已是最新版（$local_version）。"
+  prompt_input "是否强制重新安装官方包？(Y/N，默认为N): "
+  force_choice="$REPLY"
+  if [[ "$force_choice" = "y" || "$force_choice" = "Y" ]]; then
+    print_msg "$YELLOW" "正在强制重新安装 $latest_version ..."
+    download_and_install "$latest_version"
   else
-    print_msg "$GREEN" "当前已是最新版，无需更新。"
+    print_msg "$BLUE" "已跳过强制重装。"
   fi
 }
 
 start_openlist() {
   local first_run
   local running_pid
+  local console_url
 
   require_installed || return 1
   prepare_dirs
   cleanup_stale_pid
   first_run=0
+  console_url="$(get_console_url)"
 
   if [ ! -f "$DATA_DIR/config.json" ]; then
     first_run=1
@@ -383,25 +602,41 @@ start_openlist() {
   running_pid="$(get_running_pid 2>/dev/null || true)"
   if [ -n "$running_pid" ]; then
     print_msg "$YELLOW" "OpenList 已在运行。"
+    printf "访问地址：%b%s%b\n" "$BLUE" "$console_url" "$NC"
     return 0
   fi
 
-  if [ -f "$PLIST_PATH" ]; then
-    print_msg "$BLUE" "检测到已开启开机自启，正在通过 launchd 启动 OpenList..."
+  if is_autostart_configured; then
+    print_msg "$BLUE" "检测到已配置开机自启，正在通过 launchd 启动 OpenList..."
     launchctl_bootout
-    launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
-    launchctl enable "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
+    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
+      print_msg "$RED" "launchd bootstrap 失败，尝试前台 nohup 启动..."
+      nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
+      echo $! > "$PID_PATH"
+    else
+      launchctl enable "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
+    fi
   else
     print_msg "$BLUE" "正在启动 OpenList..."
     nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
     echo $! > "$PID_PATH"
   fi
-  sleep 2
 
-  running_pid="$(get_running_pid 2>/dev/null || true)"
+  # 等待 listen，最多约 10 秒
+  local i
+  running_pid=""
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    sleep 1
+    running_pid="$(get_running_pid 2>/dev/null || true)"
+    if [ -n "$running_pid" ]; then
+      break
+    fi
+  done
+
   if [ -n "$running_pid" ]; then
     print_msg "$GREEN" "OpenList 启动成功。"
-    printf "访问地址：%b%s%b\n" "$BLUE" "$DEFAULT_URL" "$NC"
+    printf "访问地址：%b%s%b\n" "$BLUE" "$console_url" "$NC"
+    printf "进程 PID：%b%s%b\n" "$GREEN" "$running_pid" "$NC"
     if [ "$first_run" -eq 1 ]; then
       sleep 1
       show_initial_password
@@ -422,29 +657,42 @@ stop_openlist() {
   pid="$(get_running_pid 2>/dev/null || true)"
   if [ -z "$pid" ]; then
     print_msg "$YELLOW" "OpenList 当前未运行。"
+    # 若仅 load 了 launchd 但未 running，也尝试 bootout 避免残留
+    if is_autostart_configured && is_autostart_loaded; then
+      launchctl_bootout
+    fi
     return 0
   fi
 
-  print_msg "$BLUE" "正在停止 OpenList..."
-  if [ -f "$PLIST_PATH" ]; then
+  print_msg "$BLUE" "正在停止 OpenList (PID $pid)..."
+  if is_autostart_configured; then
     launchctl_bootout
   fi
   kill "$pid" >/dev/null 2>&1 || true
 
-  for _ in 1 2 3 4 5; do
-    if ! is_running; then
+  local _
+  for _ in 1 2 3 4 5 6 7 8; do
+    if ! kill -0 "$pid" 2>/dev/null; then
       break
     fi
     sleep 1
   done
 
-  if is_running; then
-    pid="$(get_running_pid 2>/dev/null || true)"
-    [ -n "$pid" ] && kill -9 "$pid" >/dev/null 2>&1 || true
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" >/dev/null 2>&1 || true
+  fi
+
+  # 再清一次端口上残留
+  pid="$(find_pid_by_listen_port 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    kill -9 "$pid" >/dev/null 2>&1 || true
   fi
 
   rm -f "$PID_PATH"
   print_msg "$GREEN" "OpenList 已停止。"
+  if is_autostart_configured; then
+    print_msg "$BLUE" "开机自启仍已配置；下次登录或手动「启动」时会再次拉起。"
+  fi
 }
 
 restart_openlist() {
@@ -455,11 +703,16 @@ restart_openlist() {
 show_status() {
   local current_version
   local running_pid
+  local console_url
+  local active_cmd
 
   cleanup_stale_pid
+  console_url="$(get_console_url)"
+
+  printf "管理脚本：%b%s%b\n" "$BLUE" "$SCRIPT_VERSION" "$NC"
 
   if [ -x "$APP_BIN" ]; then
-    current_version="$(get_local_version)"
+    current_version="$(get_local_version || true)"
     printf "程序状态：%b已安装%b\n" "$GREEN" "$NC"
     printf "程序路径：%b%s%b\n" "$BLUE" "$APP_BIN" "$NC"
     if [ -n "$current_version" ]; then
@@ -474,33 +727,125 @@ show_status() {
   running_pid="$(get_running_pid 2>/dev/null || true)"
   if [ -n "$running_pid" ]; then
     printf "运行状态：%b运行中%b\n" "$GREEN" "$NC"
-    printf "访问地址：%b%s%b\n" "$BLUE" "$DEFAULT_URL" "$NC"
+    printf "访问地址：%b%s%b\n" "$BLUE" "$console_url" "$NC"
+    printf "监听端口：%b%s%b\n" "$BLUE" "$(get_http_port)" "$NC"
     printf "进程 PID：%b%s%b\n" "$GREEN" "$running_pid" "$NC"
   else
     printf "运行状态：%b已停止%b\n" "$RED" "$NC"
+    printf "配置端口：%b%s%b\n" "$BLUE" "$(get_http_port)" "$NC"
   fi
 
-  if [ -f "$PLIST_PATH" ]; then
-    printf "开机自启：%b已开启%b\n" "$GREEN" "$NC"
+  if is_autostart_configured; then
+    if is_autostart_loaded; then
+      printf "开机自启：%b已配置且已加载%b\n" "$GREEN" "$NC"
+    else
+      printf "开机自启：%b已配置（当前未加载）%b\n" "$YELLOW" "$NC"
+    fi
   else
-    printf "开机自启：%b未开启%b\n" "$RED" "$NC"
+    printf "开机自启：%b未配置%b\n" "$RED" "$NC"
+  fi
+
+  active_cmd="$(command -v openlist 2>/dev/null || true)"
+  if [ -n "$active_cmd" ]; then
+    printf "PATH 入口：%b%s%b\n" "$BLUE" "$active_cmd" "$NC"
   fi
 
   printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
   printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
 }
 
+print_menu_summary() {
+  local ver="未安装"
+  local run="已停止"
+  local port
+  local auto="关"
+  local pid
+
+  port="$(get_http_port)"
+  if [ -x "$APP_BIN" ]; then
+    ver="$(get_local_version 2>/dev/null || echo 未知)"
+  fi
+  pid="$(get_running_pid 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    run="运行中 PID $pid"
+  fi
+  if is_autostart_configured; then
+    if is_autostart_loaded; then
+      auto="已配置/已加载"
+    else
+      auto="已配置/未加载"
+    fi
+  fi
+
+  printf "  版本：%b%s%b  |  状态：%b%s%b\n" "$GREEN" "$ver" "$NC" "$BLUE" "$run" "$NC"
+  printf "  端口：%b%s%b  |  自启：%b%s%b  |  脚本：%b%s%b\n\n" \
+    "$BLUE" "$port" "$NC" "$BLUE" "$auto" "$NC" "$BLUE" "$SCRIPT_VERSION" "$NC"
+}
+
 open_console() {
-  require_cmd "open" "macOS 自带 open 命令。"
+  local console_url
+
+  require_cmd "open" "macOS 自带 open 命令。" || return 1
+  console_url="$(get_console_url)"
 
   if ! get_running_pid >/dev/null 2>&1; then
     print_msg "$YELLOW" "OpenList 尚未运行，正在自动启动..."
     start_openlist || return 1
   fi
 
-  open "$DEFAULT_URL"
+  open "$console_url"
   print_msg "$GREEN" "已使用默认浏览器打开 OpenList 控制台。"
+  printf "地址：%b%s%b\n" "$BLUE" "$console_url" "$NC"
   print_msg "$BLUE" "如果忘记管理员密码，可回菜单使用“密码管理”。"
+}
+
+view_logs() {
+  local choice
+
+  prepare_dirs
+  echo "1. 查看最近 50 行日志"
+  echo "2. 查看最近 200 行日志"
+  echo "3. 在 Finder 中打开日志目录"
+  echo "4. 用系统默认程序打开日志文件"
+  echo "0. 返回主菜单"
+  prompt_input "请选择(0/1/2/3/4，默认为1): "
+  choice="$REPLY"
+
+  case "$choice" in
+    ""|1)
+      if [ -f "$LOG_PATH" ]; then
+        echo
+        tail -n 50 "$LOG_PATH"
+      else
+        print_msg "$YELLOW" "日志文件尚不存在：$LOG_PATH"
+      fi
+      ;;
+    2)
+      if [ -f "$LOG_PATH" ]; then
+        echo
+        tail -n 200 "$LOG_PATH"
+      else
+        print_msg "$YELLOW" "日志文件尚不存在：$LOG_PATH"
+      fi
+      ;;
+    3)
+      open "$LOG_DIR" 2>/dev/null || print_msg "$RED" "无法打开日志目录。"
+      ;;
+    4)
+      if [ -f "$LOG_PATH" ]; then
+        open "$LOG_PATH"
+      else
+        print_msg "$YELLOW" "日志文件尚不存在：$LOG_PATH"
+      fi
+      ;;
+    0)
+      return 0
+      ;;
+    *)
+      print_msg "$RED" "无效选择。"
+      return 1
+      ;;
+  esac
 }
 
 password_menu() {
@@ -521,7 +866,10 @@ password_menu() {
       return 0
       ;;
     1)
-      "$APP_BIN" --data "$DATA_DIR" admin random
+      "$APP_BIN" --data "$DATA_DIR" admin random || {
+        print_msg "$RED" "随机密码生成失败。"
+        return 1
+      }
       if is_running; then
         print_msg "$BLUE" "正在重启 OpenList，使新密码立即生效并清除登录封禁..."
         restart_openlist
@@ -534,7 +882,10 @@ password_menu() {
         print_msg "$YELLOW" "密码为空，已取消修改。"
         return 0
       fi
-      "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass"
+      "$APP_BIN" --data "$DATA_DIR" admin set "$new_pass" || {
+        print_msg "$RED" "设置密码失败。"
+        return 1
+      }
       print_msg "$GREEN" "管理员密码已重置。"
       if is_running; then
         print_msg "$BLUE" "正在重启 OpenList，使新密码立即生效并清除登录封禁..."
@@ -562,7 +913,7 @@ run_official_command() {
       ;;
     clear-logs|login-help)
       print_msg "$YELLOW" "这个脚本已移除该功能：$1"
-      print_msg "$BLUE" "如需查看日志，可在菜单“查看状态”里查看日志路径。"
+      print_msg "$BLUE" "如需查看日志，可在菜单使用“查看日志”。"
       return 1
       ;;
   esac
@@ -612,6 +963,8 @@ PLIST
 
 launchctl_bootout() {
   launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
+  # 兼容部分系统用 label 卸载
+  launchctl bootout "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
 }
 
 enable_autostart() {
@@ -619,7 +972,10 @@ enable_autostart() {
   mkdir -p "$HOME/Library/LaunchAgents"
   write_plist
   launchctl_bootout
-  launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"
+  if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
+    print_msg "$RED" "设置开机自启失败（launchctl bootstrap）。"
+    return 1
+  fi
   launchctl enable "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
   print_msg "$GREEN" "已设置开机自启。"
 }
@@ -637,9 +993,18 @@ disable_autostart() {
 remove_entry() {
   local candidate
 
-  for candidate in "$HOME/.local/bin/openlist" "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist"; do
-    if [ -L "$candidate" ]; then
-      rm -f "$candidate"
+  for candidate in "$HOME/.local/bin/openlist" "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist" "$HOME/openlist_manager.sh"; do
+    if [ -L "$candidate" ] || [ -f "$candidate" ]; then
+      # 仅删除指向本管理目录的入口，避免误删无关 openlist
+      if [ -L "$candidate" ]; then
+        local target
+        target="$(readlink "$candidate" 2>/dev/null || true)"
+        if [[ "$target" == *".openlist-manager"* ]] || [[ "$target" == "$MANAGER_PATH" ]]; then
+          rm -f "$candidate"
+        fi
+      elif [[ "$candidate" == "$HOME/openlist_manager.sh" ]]; then
+        rm -f "$candidate"
+      fi
     fi
   done
 }
@@ -648,11 +1013,18 @@ full_uninstall() {
   local confirm
 
   print_msg "$RED" "警告：此操作将删除 OpenList 程序、数据、日志、自启项及本脚本本身。"
-  prompt_input "确认继续吗？(Y/N，默认为Y): "
+  print_msg "$YELLOW" "数据目录：$DATA_DIR"
+  prompt_input "确认继续吗？(Y/N，默认为N): "
   confirm="$REPLY"
 
-  if [[ "$confirm" = "n" || "$confirm" = "N" ]]; then
+  if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
     print_msg "$YELLOW" "已取消卸载。"
+    return 0
+  fi
+
+  prompt_input "请再次输入 YES 以确认彻底删除: "
+  if [[ "$REPLY" != "YES" ]]; then
+    print_msg "$YELLOW" "确认词不匹配，已取消卸载。"
     return 0
   fi
 
@@ -667,16 +1039,27 @@ full_uninstall() {
 update_script() {
   local temp_installer
 
-  require_cmd "curl" "macOS 通常自带 curl。"
+  require_cmd "curl" "macOS 通常自带 curl。" || return 1
   prepare_dirs
   temp_installer="$TMP_DIR/install_openlist_mac.sh"
 
   print_msg "$BLUE" "正在从 GitHub 获取最新脚本..."
-  curl -fsSL "$INSTALLER_URL" -o "$temp_installer"
+  print_msg "$YELLOW" "注意：若远程仓库尚未同步本次修复，更新后可能覆盖本地改进。"
+  if ! curl -fsSL -A "$CURL_UA" "$INSTALLER_URL" -o "$temp_installer"; then
+    print_msg "$RED" "下载安装脚本失败。"
+    return 1
+  fi
+  if [ ! -s "$temp_installer" ]; then
+    print_msg "$RED" "下载的安装脚本为空。"
+    return 1
+  fi
   chmod +x "$temp_installer"
 
   print_msg "$BLUE" "正在更新本地脚本..."
-  OPENLIST_SKIP_MENU_AUTORUN=1 zsh "$temp_installer"
+  OPENLIST_SKIP_MENU_AUTORUN=1 zsh "$temp_installer" || {
+    print_msg "$RED" "执行安装脚本失败。"
+    return 1
+  }
 
   print_msg "$GREEN" "脚本更新完成。"
   if [[ -t 0 && -t 1 ]]; then
@@ -691,8 +1074,9 @@ show_menu() {
   printf "%b====================================%b\n" "$GREEN" "$NC"
   printf "%b       OpenList 管理脚本 (macOS)      %b\n" "$GREEN" "$NC"
   printf "%b====================================%b\n\n" "$GREEN" "$NC"
+  print_menu_summary
   echo " 1. 安装 OpenList"
-  echo " 2. 更新 OpenList"
+  echo " 2. 更新 OpenList（已最新时可强制重装）"
   echo " 3. 彻底卸载 (程序、数据及本脚本本身)"
   echo " 4. 查看状态"
   echo " 5. 一键打开网页控制台"
@@ -703,6 +1087,7 @@ show_menu() {
   echo "10. 设置开机自启"
   echo "11. 取消开机自启"
   echo "12. 更新脚本"
+  echo "13. 查看日志"
   echo " 0. 退出脚本"
   echo
 }
@@ -734,6 +1119,7 @@ while true; do
     10) enable_autostart ;;
     11) disable_autostart ;;
     12) update_script ;;
+    13) view_logs ;;
     0) exit 0 ;;
     *) print_msg "$RED" "无效输入，请重新选择。" ;;
   esac
@@ -746,69 +1132,39 @@ EOF
 
 chmod +x "$MANAGER_PATH"
 
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$MANAGER_PATH" "$HOME/.local/bin/openlist"
+
+# 兼容旧入口
+if [ -w /usr/local/bin ] 2>/dev/null; then
+  ln -sfn "$MANAGER_PATH" /usr/local/bin/openlist 2>/dev/null || true
+fi
+
+# 家目录快捷入口
+cat > "$HOME/openlist_manager.sh" <<'WRAP'
+#!/bin/zsh
+
+set -euo pipefail
+
+TARGET="$HOME/.openlist-manager/openlist-menu.sh"
+
+if [[ ! -x "$TARGET" ]]; then
+  print -u2 -- "未找到 OpenList 管理脚本：$TARGET"
+  print -u2 -- "请重新安装或重新生成 OpenList 管理脚本后再试。"
+  exit 1
+fi
+
+exec "$TARGET" "$@"
+WRAP
+chmod +x "$HOME/openlist_manager.sh"
+
 remove_legacy_entry
-
-for candidate in "$HOME/.local/bin" "/usr/local/bin" "/opt/homebrew/bin"; do
-  if [ -d "$candidate" ] || mkdir -p "$candidate" 2>/dev/null; then
-    if [ -w "$candidate" ]; then
-      ln -sf "$MANAGER_PATH" "$candidate/openlist"
-      LINK_TARGET="$candidate/openlist"
-      break
-    fi
-  fi
-done
-
-LINK_TARGET="${LINK_TARGET:-$MANAGER_PATH}"
-
-case ":$PATH:" in
-  *":$HOME/.local/bin:"*) ;;
-  *)
-    SHELL_RC=""
-    if [ -n "${ZSH_VERSION:-}" ]; then
-      SHELL_RC="$HOME/.zshrc"
-    elif [ -n "${BASH_VERSION:-}" ]; then
-      SHELL_RC="$HOME/.bash_profile"
-    elif [ -f "$HOME/.zshrc" ]; then
-      SHELL_RC="$HOME/.zshrc"
-    elif [ -f "$HOME/.bash_profile" ]; then
-      SHELL_RC="$HOME/.bash_profile"
-    else
-      SHELL_RC="$HOME/.zshrc"
-    fi
-
-    mkdir -p "$(dirname "$SHELL_RC")"
-    touch "$SHELL_RC"
-    if ! grep -F 'export PATH="$HOME/.local/bin:$PATH"' "$SHELL_RC" >/dev/null 2>&1; then
-      printf '\nexport PATH="$HOME/.local/bin:$PATH"\n' >> "$SHELL_RC"
-    fi
-    export PATH="$HOME/.local/bin:$PATH"
-    ;;
-esac
-
 warn_if_legacy_remains
 
-cat <<MSG
-============================================
-OpenList 菜单脚本安装成功
-
-以后你可以在终端输入：
-  openlist
-
-即可进入 OpenList 管理脚本菜单
-
-如果提示找不到 openlist，可直接运行：
-  $MANAGER_PATH
-
-当前入口位置：
-  $LINK_TARGET
-
-如果当前终端还提示找不到 openlist，可执行：
-  hash -r
-============================================
-MSG
+echo "OpenList 管理脚本已安装/更新："
+echo "  $MANAGER_PATH"
+echo "命令入口：openlist  或  $HOME/openlist_manager.sh"
 
 if [[ "${OPENLIST_SKIP_MENU_AUTORUN:-0}" != "1" && -t 0 && -t 1 ]]; then
-  echo
-  echo "正在进入 OpenList 管理菜单..."
   exec "$MANAGER_PATH"
 fi
