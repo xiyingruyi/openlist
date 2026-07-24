@@ -11,7 +11,6 @@ rm -f "$MANAGER_DIR/api-token" 2>/dev/null || true
 remove_legacy_entry() {
   for legacy in "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist"; do
     if [ -L "$legacy" ] || [ -f "$legacy" ]; then
-      # 仅尝试删除；无权限时跳过并在后面提示
       rm -f "$legacy" 2>/dev/null || true
     fi
   done
@@ -19,7 +18,6 @@ remove_legacy_entry() {
 
 warn_if_legacy_remains() {
   local active_cmd
-
   active_cmd="$(command -v openlist 2>/dev/null || true)"
   if [ -n "$active_cmd" ] && [ "$active_cmd" != "$HOME/.local/bin/openlist" ]; then
     cat <<WARN
@@ -42,7 +40,7 @@ cat > "$MANAGER_PATH" <<'EOF'
 set -u
 
 # 本地管理脚本版本（上传 GitHub 后，选「更新脚本」才会同步到别人机器）
-SCRIPT_VERSION="2026.07.24.1"
+SCRIPT_VERSION="2026.07.24.2"
 
 APP_NAME="OpenList"
 MANAGER_DIR="${OPENLIST_MANAGER_DIR:-$HOME/.openlist-manager}"
@@ -53,18 +51,23 @@ APP_BIN="$APP_DIR/openlist"
 VERSION_FILE="$APP_DIR/version.txt"
 ARCHIVE_PATH="$TMP_DIR/openlist.tar.gz"
 EXTRACT_DIR="$TMP_DIR/extract"
+MD5_LIST_PATH="$TMP_DIR/md5.txt"
 DATA_DIR="${OPENLIST_DATA_DIR:-$HOME/Library/Application Support/OpenList/data}"
 RUN_DIR="${OPENLIST_RUN_DIR:-$HOME/Library/Application Support/OpenList/run}"
 LOG_DIR="${OPENLIST_LOG_DIR:-$HOME/Library/Logs/OpenList}"
 LOG_PATH="$LOG_DIR/openlist.log"
 PID_PATH="$RUN_DIR/openlist.pid"
 PLIST_PATH="${OPENLIST_PLIST_PATH:-$HOME/Library/LaunchAgents/com.openlist.server.plist}"
+# 开机自启开关（与是否用 launchd 管进程分开：日常启停一律走 launchd）
+AUTOSTART_FLAG="${OPENLIST_AUTOSTART_FLAG:-$MANAGER_DIR/autostart.on}"
 INSTALLER_URL="https://raw.githubusercontent.com/xiyingruyi/openlist/main/install_openlist_mac.sh"
 GITHUB_REPO="OpenListTeam/OpenList"
 GITHUB_API="https://api.github.com/repos/${GITHUB_REPO}"
 GITHUB_RELEASES="https://github.com/${GITHUB_REPO}/releases"
-# 下载包最小体积（字节），防止半截/空文件当成功
+LAUNCH_LABEL="${OPENLIST_LAUNCH_LABEL:-com.openlist.server}"
 MIN_ARCHIVE_BYTES=1048576
+# 日志超过该大小则轮转（50MB）
+LOG_MAX_BYTES=52428800
 CURL_UA="OpenList-macOS-Manager/${SCRIPT_VERSION}"
 
 GREEN='\033[0;32m'
@@ -84,7 +87,7 @@ pause() {
   if [[ -t 0 ]]; then
     read -rsk 1 "REPLY?按任意键返回主菜单..."
   else
-    IFS= read -r REPLY
+    IFS= read -r REPLY || true
   fi
   echo
 }
@@ -99,6 +102,7 @@ prompt_input() {
 
 prepare_dirs() {
   mkdir -p "$MANAGER_DIR" "$APP_DIR" "$TMP_DIR" "$DATA_DIR" "$RUN_DIR" "$LOG_DIR"
+  # LaunchAgents 目录在写 plist 时再确保
 }
 
 require_cmd() {
@@ -124,17 +128,63 @@ detect_arch() {
   esac
 }
 
-download_url() {
+asset_name() {
   local arch
   arch="$(detect_arch)" || return 1
-  echo "${GITHUB_RELEASES}/latest/download/openlist-darwin-${arch}.tar.gz"
+  echo "openlist-darwin-${arch}.tar.gz"
 }
 
+download_url() {
+  local name
+  name="$(asset_name)" || return 1
+  echo "${GITHUB_RELEASES}/latest/download/${name}"
+}
+
+# 精确读取 scheme.http_port（OpenList 真实字段）；失败再兜底
 get_http_port() {
   local port=""
+  local cfg="$DATA_DIR/config.json"
 
-  if [ -f "$DATA_DIR/config.json" ]; then
-    port="$(sed -n 's/.*"http_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$DATA_DIR/config.json" | head -n 1)"
+  if [ -f "$cfg" ]; then
+    if command -v python3 >/dev/null 2>&1; then
+      port="$(
+        python3 - "$cfg" <<'PY' 2>/dev/null || true
+import json, sys
+path = sys.argv[1]
+try:
+    with open(path, "r", encoding="utf-8") as f:
+        data = json.load(f)
+except Exception:
+    sys.exit(0)
+scheme = data.get("scheme") or {}
+port = scheme.get("http_port")
+if port is None:
+    port = data.get("http_port")
+try:
+    port = int(port)
+except Exception:
+    sys.exit(0)
+if port > 0:
+    print(port)
+PY
+      )"
+    fi
+
+    # 无 python3 或解析失败：优先匹配 scheme 段内 http_port
+    if [ -z "$port" ]; then
+      port="$(
+        awk '
+          /"scheme"[[:space:]]*:/ { in_scheme=1 }
+          in_scheme && /"http_port"[[:space:]]*:/ {
+            if (match($0, /[0-9]+/)) { print substr($0, RSTART, RLENGTH); exit }
+          }
+          in_scheme && /}/ { in_scheme=0 }
+        ' "$cfg" 2>/dev/null | head -n 1
+      )"
+    fi
+    if [ -z "$port" ]; then
+      port="$(sed -n 's/.*"http_port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' "$cfg" | head -n 1)"
+    fi
   fi
 
   printf '%s\n' "${port:-5244}"
@@ -145,11 +195,9 @@ get_console_url() {
 }
 
 normalize_version() {
-  # 提取 x.y / x.y.z / x.y.z.w
   printf '%s\n' "$1" | tr -d '\r' | grep -Eo '[0-9]+(\.[0-9]+){1,3}' | head -n 1
 }
 
-# 从二进制读取真实版本（权威来源）
 read_binary_version() {
   local raw
 
@@ -176,7 +224,6 @@ get_local_version() {
 
   bin_ver="$(read_binary_version 2>/dev/null || true)"
   if [ -n "$bin_ver" ]; then
-    # 以二进制为准；version.txt 仅缓存，不一致则回写
     if [ -f "$VERSION_FILE" ]; then
       file_ver="$(normalize_version "$(cat "$VERSION_FILE" 2>/dev/null)")"
       if [ "$file_ver" != "$bin_ver" ]; then
@@ -207,7 +254,6 @@ get_latest_version() {
 
   require_cmd "curl" "macOS 通常自带 curl。" || return 1
 
-  # 优先 GitHub API
   http_body="$(curl -fsSL -A "$CURL_UA" \
     -H "Accept: application/vnd.github+json" \
     "${GITHUB_API}/releases/latest" 2>/dev/null || true)"
@@ -215,7 +261,6 @@ get_latest_version() {
     raw="$(printf '%s\n' "$http_body" | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
   fi
 
-  # API 失败时：跟随 latest 跳转，从最终 URL 解析 tag
   if [ -z "$raw" ]; then
     location="$(curl -fsSL -A "$CURL_UA" -o /dev/null -w '%{url_effective}' \
       "${GITHUB_RELEASES}/latest" 2>/dev/null || true)"
@@ -241,7 +286,6 @@ EOFV
 }
 
 is_version_newer() {
-  # zsh 的 [ ] 里 '>' 会被当成重定向，必须用 [[ ]]
   local newer older
   newer="$(version_to_sort_key "$1")"
   older="$(version_to_sort_key "$2")"
@@ -259,12 +303,26 @@ is_running() {
   get_running_pid >/dev/null 2>&1
 }
 
+# 兼容旧版：仅有 plist 且 KeepAlive/RunAtLoad 为 true 时视为已开自启
+migrate_autostart_flag_if_needed() {
+  if [ -f "$AUTOSTART_FLAG" ]; then
+    return 0
+  fi
+  if [ -f "$PLIST_PATH" ] && grep -q '<key>KeepAlive</key>' "$PLIST_PATH" 2>/dev/null; then
+    if grep -A1 '<key>KeepAlive</key>' "$PLIST_PATH" 2>/dev/null | grep -q '<true/>'; then
+      mkdir -p "$MANAGER_DIR"
+      : > "$AUTOSTART_FLAG"
+    fi
+  fi
+}
+
 is_autostart_configured() {
-  [ -f "$PLIST_PATH" ]
+  migrate_autostart_flag_if_needed
+  [ -f "$AUTOSTART_FLAG" ]
 }
 
 is_autostart_loaded() {
-  launchctl print "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1
+  launchctl print "gui/$(id -u)/${LAUNCH_LABEL}" >/dev/null 2>&1
 }
 
 pid_command_looks_like_openlist() {
@@ -289,7 +347,6 @@ pid_is_openlist_server() {
     return 0
   fi
 
-  # 启动中尚未 listen：用命令行兜底
   pid_command_looks_like_openlist "$pid"
 }
 
@@ -313,7 +370,7 @@ get_launchd_pid() {
   local launchd_info
   local pid
 
-  launchd_info="$(launchctl print "gui/$(id -u)/com.openlist.server" 2>/dev/null || true)"
+  launchd_info="$(launchctl print "gui/$(id -u)/${LAUNCH_LABEL}" 2>/dev/null || true)"
   [ -n "$launchd_info" ] || return 1
 
   printf '%s\n' "$launchd_info" | grep -F "state = running" >/dev/null 2>&1 || return 1
@@ -332,6 +389,12 @@ get_launchd_pid() {
 get_running_pid() {
   local pid
 
+  pid="$(get_launchd_pid 2>/dev/null || true)"
+  if [ -n "$pid" ]; then
+    printf '%s\n' "$pid"
+    return 0
+  fi
+
   if [ -f "$PID_PATH" ]; then
     pid="$(cat "$PID_PATH" 2>/dev/null)"
     if pid_is_openlist_server "$pid"; then
@@ -340,13 +403,6 @@ get_running_pid() {
     fi
   fi
 
-  pid="$(get_launchd_pid 2>/dev/null || true)"
-  if [ -n "$pid" ]; then
-    printf '%s\n' "$pid"
-    return 0
-  fi
-
-  # pid 文件丢失 / 非本脚本拉起：按监听端口反查
   pid="$(find_pid_by_listen_port 2>/dev/null || true)"
   if [ -n "$pid" ]; then
     printf '%s\n' "$pid" > "$PID_PATH" 2>/dev/null || true
@@ -363,10 +419,26 @@ cleanup_stale_pid() {
   fi
 }
 
+rotate_logs_if_needed() {
+  local size
+
+  [ -f "$LOG_PATH" ] || return 0
+  size="$(wc -c < "$LOG_PATH" | tr -d '[:space:]')"
+  if [ -n "$size" ] && [ "$size" -gt "$LOG_MAX_BYTES" ]; then
+    print_msg "$YELLOW" "日志约 ${size} 字节，超过阈值，正在轮转..."
+    rm -f "${LOG_PATH}.1"
+    mv -f "$LOG_PATH" "${LOG_PATH}.1" 2>/dev/null || true
+    : > "$LOG_PATH"
+  fi
+}
+
 show_initial_password() {
   local initial_password
 
   initial_password="$(grep -Eo 'initial password is: .*' "$LOG_PATH" 2>/dev/null | tail -n 1 | sed 's/^initial password is: //')"
+  if [ -z "$initial_password" ] && [ -f "${LOG_PATH}.1" ]; then
+    initial_password="$(grep -Eo 'initial password is: .*' "${LOG_PATH}.1" 2>/dev/null | tail -n 1 | sed 's/^initial password is: //')"
+  fi
   if [ -n "$initial_password" ]; then
     print_msg "$GREEN" "首次启动已生成默认管理员信息："
     printf "用户名：%badmin%b\n" "$GREEN" "$NC"
@@ -379,6 +451,12 @@ show_initial_password() {
 
 offer_set_password_now() {
   local choice new_pass
+
+  # 非交互环境不要读 stdin，避免把后续脚本/管道内容当密码
+  if [[ ! -t 0 ]]; then
+    print_msg "$BLUE" "非交互环境，已跳过设置密码。可稍后在菜单使用「密码管理」。"
+    return 0
+  fi
 
   echo
   prompt_input "是否现在就设置一个你自己的管理员密码？(Y/N，默认为Y): "
@@ -411,7 +489,6 @@ curl_download() {
 
   require_cmd "curl" "macOS 通常自带 curl。" || return 1
 
-  # 终端下显示进度；非交互静默
   if [[ -t 1 ]]; then
     curl -fL --connect-timeout 20 --retry 2 --retry-delay 2 \
       -A "$CURL_UA" --progress-bar "$url" -o "$dest"
@@ -421,11 +498,55 @@ curl_download() {
   fi
 }
 
+verify_archive_md5() {
+  local archive="$1"
+  local name expected actual
+
+  name="$(asset_name)" || return 0
+
+  print_msg "$BLUE" "正在校验安装包 MD5..."
+  if ! curl -fsSL -A "$CURL_UA" \
+    "${GITHUB_RELEASES}/latest/download/md5.txt" -o "$MD5_LIST_PATH"; then
+    print_msg "$YELLOW" "未能下载官方 MD5 清单，已跳过校验（仍保留体积检查）。"
+    return 0
+  fi
+
+  # 官方格式: <md5>  ./openlist-darwin-arm64.tar.gz
+  expected="$(grep -F "$name" "$MD5_LIST_PATH" 2>/dev/null | awk '{print $1}' | head -n 1)"
+  if [ -z "$expected" ]; then
+    print_msg "$YELLOW" "MD5 清单中未找到 ${name}，已跳过校验。"
+    return 0
+  fi
+
+  if command -v md5 >/dev/null 2>&1; then
+    actual="$(md5 -q "$archive" 2>/dev/null || true)"
+  elif command -v md5sum >/dev/null 2>&1; then
+    actual="$(md5sum "$archive" 2>/dev/null | awk '{print $1}')"
+  else
+    print_msg "$YELLOW" "系统无 md5/md5sum，已跳过校验。"
+    return 0
+  fi
+
+  if [ -z "$actual" ]; then
+    print_msg "$YELLOW" "无法计算本地 MD5，已跳过校验。"
+    return 0
+  fi
+
+  if [ "$actual" != "$expected" ]; then
+    print_msg "$RED" "MD5 校验失败。"
+    print_msg "$RED" "期望：$expected"
+    print_msg "$RED" "实际：$actual"
+    return 1
+  fi
+
+  print_msg "$GREEN" "MD5 校验通过。"
+  return 0
+}
+
 download_and_install() {
   local url found_bin latest_version was_running archive_size
   local staged_bin
 
-  # 可选参数：已查好的最新版本，避免重复打 API
   latest_version="${1:-}"
 
   require_cmd "curl" "macOS 通常自带 curl。" || return 1
@@ -471,6 +592,11 @@ download_and_install() {
     return 1
   fi
 
+  if ! verify_archive_md5 "$ARCHIVE_PATH"; then
+    rm -f "$ARCHIVE_PATH"
+    return 1
+  fi
+
   print_msg "$BLUE" "正在解压安装包（${archive_size} 字节）..."
   if ! tar -xzf "$ARCHIVE_PATH" -C "$EXTRACT_DIR"; then
     print_msg "$RED" "解压失败，安装包可能损坏。"
@@ -487,7 +613,6 @@ download_and_install() {
 
   stop_openlist >/dev/null 2>&1 || true
 
-  # 原子替换：先写到临时文件再 mv
   staged_bin="${APP_BIN}.new"
   rm -f "$staged_bin"
   if ! cp "$found_bin" "$staged_bin"; then
@@ -497,7 +622,6 @@ download_and_install() {
     return 1
   fi
   chmod +x "$staged_bin"
-  # 去掉隔离属性，减少 Gatekeeper 拦启动
   xattr -dr com.apple.quarantine "$staged_bin" 2>/dev/null || true
   if ! mv -f "$staged_bin" "$APP_BIN"; then
     print_msg "$RED" "替换可执行文件失败。"
@@ -508,9 +632,8 @@ download_and_install() {
   xattr -dr com.apple.quarantine "$APP_BIN" 2>/dev/null || true
 
   write_version_file "$latest_version"
-  rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH"
+  rm -rf "$EXTRACT_DIR" "$ARCHIVE_PATH" "$MD5_LIST_PATH"
 
-  # 再校验一次二进制自报版本
   local actual
   actual="$(read_binary_version 2>/dev/null || true)"
   if [ -n "$actual" ]; then
@@ -574,6 +697,10 @@ update_openlist() {
   fi
 
   print_msg "$GREEN" "当前已是最新版（$local_version）。"
+  if [[ ! -t 0 ]]; then
+    print_msg "$BLUE" "非交互环境，已跳过强制重装询问。"
+    return 0
+  fi
   prompt_input "是否强制重新安装官方包？(Y/N，默认为N): "
   force_choice="$REPLY"
   if [[ "$force_choice" = "y" || "$force_choice" = "Y" ]]; then
@@ -584,6 +711,101 @@ update_openlist() {
   fi
 }
 
+# run_at_load / keep_alive: 字符串 true 或 false（写入 plist 布尔）
+write_plist() {
+  local run_at_load="${1:-false}"
+  local keep_alive="${2:-false}"
+  local run_xml keep_xml
+
+  prepare_dirs
+  mkdir -p "$(dirname "$PLIST_PATH")"
+
+  if [[ "$run_at_load" == "true" ]]; then
+    run_xml="<true/>"
+  else
+    run_xml="<false/>"
+  fi
+  if [[ "$keep_alive" == "true" ]]; then
+    keep_xml="<true/>"
+  else
+    keep_xml="<false/>"
+  fi
+
+  cat > "$PLIST_PATH" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>${LAUNCH_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>$APP_BIN</string>
+    <string>--data</string>
+    <string>$DATA_DIR</string>
+    <string>server</string>
+  </array>
+  <key>RunAtLoad</key>
+  ${run_xml}
+  <key>KeepAlive</key>
+  ${keep_xml}
+  <key>StandardOutPath</key>
+  <string>$LOG_PATH</string>
+  <key>StandardErrorPath</key>
+  <string>$LOG_PATH</string>
+</dict>
+</plist>
+PLIST
+}
+
+launchctl_bootout() {
+  launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
+  launchctl bootout "gui/$(id -u)/${LAUNCH_LABEL}" >/dev/null 2>&1 || true
+}
+
+# 统一用 launchd 托管进程；开机自启仅影响 RunAtLoad/KeepAlive
+launchd_start_service() {
+  local domain="gui/$(id -u)"
+
+  if is_autostart_configured; then
+    write_plist "true" "true"
+  else
+    write_plist "false" "false"
+  fi
+
+  launchctl_bootout
+  if ! launchctl bootstrap "$domain" "$PLIST_PATH"; then
+    print_msg "$RED" "launchctl bootstrap 失败。"
+    return 1
+  fi
+  launchctl enable "${domain}/${LAUNCH_LABEL}" >/dev/null 2>&1 || true
+  # 确保立即拉起（尤其是 RunAtLoad=false 时）
+  launchctl kickstart -k "${domain}/${LAUNCH_LABEL}" >/dev/null 2>&1 || true
+  return 0
+}
+
+wait_for_running_pid() {
+  local seconds="${1:-12}"
+  local i pid=""
+
+  i=0
+  while [ "$i" -lt "$seconds" ]; do
+    i=$((i + 1))
+    sleep 1
+    pid="$(get_running_pid 2>/dev/null || true)"
+    if [ -n "$pid" ]; then
+      printf '%s\n' "$pid"
+      return 0
+    fi
+  done
+  return 1
+}
+
+start_via_nohup() {
+  nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
+  echo $! > "$PID_PATH"
+}
+
 start_openlist() {
   local first_run
   local running_pid
@@ -592,6 +814,7 @@ start_openlist() {
   require_installed || return 1
   prepare_dirs
   cleanup_stale_pid
+  rotate_logs_if_needed
   first_run=0
   console_url="$(get_console_url)"
 
@@ -607,33 +830,28 @@ start_openlist() {
   fi
 
   if is_autostart_configured; then
-    print_msg "$BLUE" "检测到已配置开机自启，正在通过 launchd 启动 OpenList..."
-    launchctl_bootout
-    if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
-      print_msg "$RED" "launchd bootstrap 失败，尝试前台 nohup 启动..."
-      nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
-      echo $! > "$PID_PATH"
-    else
-      launchctl enable "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
-    fi
+    print_msg "$BLUE" "正在通过 launchd 启动 OpenList（开机自启已开启）..."
   else
-    print_msg "$BLUE" "正在启动 OpenList..."
-    nohup "$APP_BIN" --data "$DATA_DIR" server >>"$LOG_PATH" 2>&1 &
-    echo $! > "$PID_PATH"
+    print_msg "$BLUE" "正在通过 launchd 启动 OpenList..."
   fi
 
-  # 等待 listen，最多约 10 秒
-  local i
   running_pid=""
-  for i in 1 2 3 4 5 6 7 8 9 10; do
-    sleep 1
-    running_pid="$(get_running_pid 2>/dev/null || true)"
-    if [ -n "$running_pid" ]; then
-      break
-    fi
-  done
+  if launchd_start_service; then
+    running_pid="$(wait_for_running_pid 12 || true)"
+  else
+    print_msg "$YELLOW" "launchd bootstrap 失败。"
+  fi
+
+  # launchd 在部分路径/权限场景下会静默失败：回退 nohup，保证可用性
+  if [ -z "$running_pid" ]; then
+    print_msg "$YELLOW" "launchd 未成功拉起进程，回退为 nohup 启动..."
+    launchctl_bootout
+    start_via_nohup
+    running_pid="$(wait_for_running_pid 12 || true)"
+  fi
 
   if [ -n "$running_pid" ]; then
+    printf '%s\n' "$running_pid" > "$PID_PATH" 2>/dev/null || true
     print_msg "$GREEN" "OpenList 启动成功。"
     printf "访问地址：%b%s%b\n" "$BLUE" "$console_url" "$NC"
     printf "进程 PID：%b%s%b\n" "$GREEN" "$running_pid" "$NC"
@@ -657,17 +875,15 @@ stop_openlist() {
   pid="$(get_running_pid 2>/dev/null || true)"
   if [ -z "$pid" ]; then
     print_msg "$YELLOW" "OpenList 当前未运行。"
-    # 若仅 load 了 launchd 但未 running，也尝试 bootout 避免残留
-    if is_autostart_configured && is_autostart_loaded; then
+    if is_autostart_loaded; then
       launchctl_bootout
     fi
     return 0
   fi
 
   print_msg "$BLUE" "正在停止 OpenList (PID $pid)..."
-  if is_autostart_configured; then
-    launchctl_bootout
-  fi
+  # 统一 bootout，避免 KeepAlive 把进程拉回来
+  launchctl_bootout
   kill "$pid" >/dev/null 2>&1 || true
 
   local _
@@ -682,7 +898,6 @@ stop_openlist() {
     kill -9 "$pid" >/dev/null 2>&1 || true
   fi
 
-  # 再清一次端口上残留
   pid="$(find_pid_by_listen_port 2>/dev/null || true)"
   if [ -n "$pid" ]; then
     kill -9 "$pid" >/dev/null 2>&1 || true
@@ -700,11 +915,57 @@ restart_openlist() {
   start_openlist
 }
 
+enable_autostart() {
+  require_installed || return 1
+  prepare_dirs
+  mkdir -p "$(dirname "$PLIST_PATH")"
+  : > "$AUTOSTART_FLAG"
+  write_plist "true" "true"
+
+  # 若当前已在跑，先停再按自启配置拉起（统一走 start_openlist，含 launchd/nohup 回退）
+  if is_running; then
+    stop_openlist >/dev/null 2>&1 || true
+  else
+    launchctl_bootout
+  fi
+
+  if ! start_openlist; then
+    print_msg "$YELLOW" "自启配置已写入，但立即启动失败；可稍后手动「启动 OpenList」。"
+    print_msg "$GREEN" "已设置开机自启（RunAtLoad + KeepAlive）。"
+    return 0
+  fi
+  print_msg "$GREEN" "已设置开机自启（RunAtLoad + KeepAlive）。"
+}
+
+disable_autostart() {
+  local was_running=0
+
+  if is_running; then
+    was_running=1
+  fi
+
+  rm -f "$AUTOSTART_FLAG"
+  launchctl_bootout
+
+  if [ -f "$PLIST_PATH" ]; then
+    # 保留可被 start 复用的非自启 plist
+    write_plist "false" "false"
+  fi
+
+  print_msg "$GREEN" "已取消开机自启。"
+
+  if [ "$was_running" -eq 1 ]; then
+    print_msg "$BLUE" "服务原先在运行，正在以非自启方式重新拉起..."
+    start_openlist || print_msg "$YELLOW" "重新启动失败，请手动启动。"
+  fi
+}
+
 show_status() {
   local current_version
   local running_pid
   local console_url
   local active_cmd
+  local log_size="0"
 
   cleanup_stale_pid
   console_url="$(get_console_url)"
@@ -727,6 +988,7 @@ show_status() {
   running_pid="$(get_running_pid 2>/dev/null || true)"
   if [ -n "$running_pid" ]; then
     printf "运行状态：%b运行中%b\n" "$GREEN" "$NC"
+    printf "托管方式：%blaunchd%b\n" "$BLUE" "$NC"
     printf "访问地址：%b%s%b\n" "$BLUE" "$console_url" "$NC"
     printf "监听端口：%b%s%b\n" "$BLUE" "$(get_http_port)" "$NC"
     printf "进程 PID：%b%s%b\n" "$GREEN" "$running_pid" "$NC"
@@ -750,8 +1012,11 @@ show_status() {
     printf "PATH 入口：%b%s%b\n" "$BLUE" "$active_cmd" "$NC"
   fi
 
+  if [ -f "$LOG_PATH" ]; then
+    log_size="$(wc -c < "$LOG_PATH" | tr -d '[:space:]')"
+  fi
   printf "数据目录：%b%s%b\n" "$BLUE" "$DATA_DIR" "$NC"
-  printf "日志文件：%b%s%b\n" "$BLUE" "$LOG_PATH" "$NC"
+  printf "日志文件：%b%s%b（%s 字节）\n" "$BLUE" "$LOG_PATH" "$NC" "$log_size"
 }
 
 print_menu_summary() {
@@ -931,82 +1196,60 @@ run_official_command() {
   esac
 }
 
-write_plist() {
-  prepare_dirs
+try_remove_path() {
+  local path="$1"
+  local hint_sudo="${2:-0}"
 
-  cat > "$PLIST_PATH" <<PLIST
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "https://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key>
-  <string>com.openlist.server</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$APP_BIN</string>
-    <string>--data</string>
-    <string>$DATA_DIR</string>
-    <string>server</string>
-  </array>
-  <key>RunAtLoad</key>
-  <true/>
-  <key>KeepAlive</key>
-  <true/>
-  <key>StandardOutPath</key>
-  <string>$LOG_PATH</string>
-  <key>StandardErrorPath</key>
-  <string>$LOG_PATH</string>
-</dict>
-</plist>
-PLIST
-}
-
-launchctl_bootout() {
-  launchctl bootout "gui/$(id -u)" "$PLIST_PATH" >/dev/null 2>&1 || true
-  # 兼容部分系统用 label 卸载
-  launchctl bootout "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
-}
-
-enable_autostart() {
-  require_installed || return 1
-  mkdir -p "$HOME/Library/LaunchAgents"
-  write_plist
-  launchctl_bootout
-  if ! launchctl bootstrap "gui/$(id -u)" "$PLIST_PATH"; then
-    print_msg "$RED" "设置开机自启失败（launchctl bootstrap）。"
-    return 1
+  if [ ! -e "$path" ] && [ ! -L "$path" ]; then
+    return 0
   fi
-  launchctl enable "gui/$(id -u)/com.openlist.server" >/dev/null 2>&1 || true
-  print_msg "$GREEN" "已设置开机自启。"
-}
 
-disable_autostart() {
-  if [ -f "$PLIST_PATH" ]; then
-    launchctl_bootout
-    rm -f "$PLIST_PATH"
-    print_msg "$GREEN" "已取消开机自启。"
+  if rm -f "$path" 2>/dev/null; then
+    return 0
+  fi
+
+  if [ "$hint_sudo" = "1" ]; then
+    print_msg "$YELLOW" "无法删除：$path（权限不足）"
+    print_msg "$BLUE" "请手动执行：sudo rm -f \"$path\""
   else
-    print_msg "$YELLOW" "当前未设置开机自启。"
+    print_msg "$YELLOW" "无法删除：$path"
   fi
+  return 1
 }
 
 remove_entry() {
-  local candidate
+  local candidate target
+  local hint
 
-  for candidate in "$HOME/.local/bin/openlist" "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist" "$HOME/openlist_manager.sh"; do
-    if [ -L "$candidate" ] || [ -f "$candidate" ]; then
-      # 仅删除指向本管理目录的入口，避免误删无关 openlist
-      if [ -L "$candidate" ]; then
-        local target
-        target="$(readlink "$candidate" 2>/dev/null || true)"
-        if [[ "$target" == *".openlist-manager"* ]] || [[ "$target" == "$MANAGER_PATH" ]]; then
-          rm -f "$candidate"
-        fi
-      elif [[ "$candidate" == "$HOME/openlist_manager.sh" ]]; then
-        rm -f "$candidate"
+  for candidate in "$HOME/.local/bin/openlist" "/usr/local/bin/openlist" "/opt/homebrew/bin/openlist"; do
+    hint=0
+    if [[ "$candidate" == /usr/* ]] || [[ "$candidate" == /opt/* ]]; then
+      hint=1
+    fi
+
+    if [ -L "$candidate" ]; then
+      target="$(readlink "$candidate" 2>/dev/null || true)"
+      # 仅删除指向本管理目录的入口，避免误伤其他安装
+      if [[ "$target" == "$MANAGER_PATH" ]] || [[ "$target" == "$MANAGER_DIR/"* ]]; then
+        try_remove_path "$candidate" "$hint" || true
       fi
     fi
   done
+
+  # 家目录快捷入口：仅当内容指向本脚本时删除
+  if [ -f "$HOME/openlist_manager.sh" ] || [ -L "$HOME/openlist_manager.sh" ]; then
+    if [ -L "$HOME/openlist_manager.sh" ]; then
+      target="$(readlink "$HOME/openlist_manager.sh" 2>/dev/null || true)"
+      if [[ "$target" == "$MANAGER_PATH" ]] || [[ "$target" == "$MANAGER_DIR/"* ]]; then
+        try_remove_path "$HOME/openlist_manager.sh" 0 || true
+      fi
+    elif grep -Fq "$MANAGER_PATH" "$HOME/openlist_manager.sh" 2>/dev/null \
+      || grep -Fq "$MANAGER_DIR/openlist-menu.sh" "$HOME/openlist_manager.sh" 2>/dev/null; then
+      try_remove_path "$HOME/openlist_manager.sh" 0 || true
+    fi
+  fi
+
+  return 0
 }
 
 full_uninstall() {
@@ -1028,8 +1271,11 @@ full_uninstall() {
     return 0
   fi
 
-  disable_autostart >/dev/null 2>&1 || true
+  # 先清自启标记再停止，避免 disable_autostart 在卸载流程里把服务又拉起来
+  rm -f "$AUTOSTART_FLAG"
   stop_openlist >/dev/null 2>&1 || true
+  launchctl_bootout
+  rm -f "$PLIST_PATH"
   remove_entry
   rm -rf "$MANAGER_DIR" "$HOME/Library/Application Support/OpenList" "$HOME/Library/Logs/OpenList"
   print_msg "$GREEN" "OpenList 已彻底卸载完成。"
@@ -1135,12 +1381,10 @@ chmod +x "$MANAGER_PATH"
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$MANAGER_PATH" "$HOME/.local/bin/openlist"
 
-# 兼容旧入口
 if [ -w /usr/local/bin ] 2>/dev/null; then
   ln -sfn "$MANAGER_PATH" /usr/local/bin/openlist 2>/dev/null || true
 fi
 
-# 家目录快捷入口
 cat > "$HOME/openlist_manager.sh" <<'WRAP'
 #!/bin/zsh
 
@@ -1165,6 +1409,7 @@ echo "OpenList 管理脚本已安装/更新："
 echo "  $MANAGER_PATH"
 echo "命令入口：openlist  或  $HOME/openlist_manager.sh"
 
+# 注意：不能写成 [[ cond ]] && exec —— set -e 下 cond 为假会直接退出
 if [[ "${OPENLIST_SKIP_MENU_AUTORUN:-0}" != "1" && -t 0 && -t 1 ]]; then
   exec "$MANAGER_PATH"
 fi
